@@ -196,14 +196,40 @@ def main() -> None:
         epub_resources = [
             ex.CapturedResource(
                 path=html_path, sequence=30, sha256=ex._sha256(html_path),
-                size=len(html), source="load_job.ReadRawData",
+                size=len(html), source="load_job.ReadRawData", page=0,
                 url="cjh://book/item/xhtml/p-cover.xhtml",
             ),
             ex.CapturedResource(
                 path=cover_path, sequence=31, sha256=ex._sha256(cover_path),
-                size=len(cover), source="load_job.ReadRawData",
+                size=len(cover), source="load_job.ReadRawData", page=1,
                 url="cjh://book/item/image/cover.jpg",
             ),
+        ]
+        selected = ex._epub_resources(
+            [
+                ex.CapturedResource(
+                    path=cover_path, sequence=29, sha256=ex._sha256(cover_path),
+                    size=len(cover), source="load_job.ReadRawData", page=-1,
+                    url="cjh://book/item/xhtml/stale.xhtml",
+                ),
+                *epub_resources,
+            ],
+            drop_startup=True,
+        )
+        assert list(selected) == ["xhtml/p-cover.xhtml", "image/cover.jpg"]
+        reordered = ex._epub_resources(
+            [
+                ex.CapturedResource(
+                    path=cover_path, sequence=29, sha256=ex._sha256(cover_path),
+                    size=len(cover), source="load_job.ReadRawData", page=-1,
+                    url="cjh://book/item/xhtml/stale.xhtml",
+                ),
+                *epub_resources,
+            ],
+            reorder_startup=True,
+        )
+        assert list(reordered) == [
+            "image/cover.jpg", "xhtml/p-cover.xhtml", "xhtml/stale.xhtml"
         ]
         epub_path = ex.export_epub(
             epub_resources, Path(temporary) / "epub" / "book.epub", Path("book.dmmr")
@@ -213,13 +239,22 @@ def main() -> None:
             assert archive.getinfo("mimetype").compress_type == zipfile.ZIP_STORED
             assert archive.read("mimetype") == b"application/epub+zip"
             assert "dcterms:modified" in archive.read("OEBPS/content.opf").decode()
+            assert 'toc="ncx"' in archive.read("OEBPS/content.opf").decode()
+            assert archive.read("OEBPS/toc.ncx").startswith(b"<?xml")
+            assert "META-INF/" in archive.namelist()
+            assert "OEBPS/" in archive.namelist()
+            assert "OEBPS/xhtml/" in archive.namelist()
             assert archive.testzip() is None
             assert "OEBPS/xhtml/p-cover.xhtml" in archive.namelist()
             assert "OEBPS/image/cover.jpg" in archive.namelist()
             assert archive.read("OEBPS/image/cover.jpg") == cover
 
         assert "this.buffer.add(16).readPointer()" in ex.JS
+        assert "page: navigationPage" in ex.JS
+        assert "position.add(8).writeS64(0)" in ex.JS
+        assert "last-position.reset" in ex.JS
         assert "return installURLRead('load_job.ReadRawData', target);" in ex.JS
+        ex.validate_navigation_coverage(307, [0, *range(307)], 306)
 
         fixed_output = ex.export_fixed_epub(
             [
@@ -231,12 +266,16 @@ def main() -> None:
             Path(temporary) / "fixed-epub" / "book.epub",
             Path("book.dmme"),
             page_count=3,
+            initial_page=2,
         )
         with zipfile.ZipFile(fixed_output) as archive:
             assert archive.namelist()[0] == "mimetype"
             assert archive.getinfo("mimetype").compress_type == zipfile.ZIP_STORED
             assert archive.testzip() is None
             assert "dcterms:modified" in archive.read("OEBPS/content.opf").decode()
+            assert 'name="cover"' in archive.read("OEBPS/content.opf").decode()
+            assert 'toc="ncx"' in archive.read("OEBPS/content.opf").decode()
+            assert "OEBPS/toc.ncx" in archive.namelist()
             assert len([
                 name for name in archive.namelist()
                 if name.startswith("OEBPS/xhtml/page-")

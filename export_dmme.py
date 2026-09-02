@@ -26,6 +26,15 @@ from PIL import Image
 
 VIEWER_SHA256 = "edfac9ac051fdb6726dcc77168d661f546c062e64b3e05af405f2b2bf71cfd5f"
 LOAD_JOB_READ_RAW_RVA = 0x8B340
+LAST_POSITION_RVA = 0x40070
+# The last-position loader has no link-dependent branch in this build.
+LAST_POSITION_SIGNATURE = (
+    "48 8B C4 48 89 48 08 56 57 41 56 48 83 EC 60 "
+    "48 C7 40 C0 FE FF FF FF 48 89 58 10 48 89 68 18 "
+    "48 8B DA 48 8B F9 33 ED 89 68 B8 89 29 48 C7 41 08 "
+    "FF FF FF FF 48 C7 41 28 0F 00 00 00 48 89 69 20 40 "
+    "88 69 10 89 69 30"
+)
 # The tail-jump displacement is link-dependent; the invariant prefix ends at E9.
 LOAD_JOB_READ_RAW_SIGNATURE = "45 89 01 48 8B 89 18 01 00 00 4D 8B C1 E9"
 EPUB_SUFFIXES = {".dmme", ".dmmr"}
@@ -193,6 +202,7 @@ function installURLRead(name, target) {
                 source: name,
                 owner: this.owner,
                 url: urlForOwner(this.owner),
+                page: navigationPage,
                 sequence: this.sequence,
                 requested: this.capacity,
                 size: n
@@ -205,6 +215,7 @@ function installURLRead(name, target) {
               source: name,
               owner: this.owner,
               url: urlForOwner(this.owner),
+              page: navigationPage,
               sequence: this.sequence
             });
           }
@@ -363,6 +374,72 @@ function installURLMetadata() {
   send({type: 'url-metadata-ready', requestCtor: !!requestCtor,
         jobCtor: !!jobCtor});
   return urlMetadataInstalled;
+}
+
+function installLastPositionReset() {
+  const rva = __LAST_POSITION_RVA__;
+  if (!navigationEnabled) return false;
+  let target = null;
+  if (rva !== null) {
+    target = main.base.add(rva);
+    send({type: 'last-position-resolved', mode: 'rva', matches: 1,
+          address: target.toString()});
+  } else {
+    try {
+      const matches = [];
+      for (const range of main.enumerateRanges('r-x')) {
+        for (const hit of Memory.scanSync(
+          range.base, range.size, '__LAST_POSITION_SIGNATURE__'
+        )) matches.push(hit.address);
+      }
+      send({type: 'last-position-resolved', mode: 'signature',
+            matches: matches.length,
+            addresses: matches.map(function(address) { return address.toString(); })});
+      if (matches.length !== 1) {
+        send({type: 'hook-error', name: 'last-position.reset',
+              error: 'signature did not resolve uniquely'});
+        return false;
+      }
+      target = matches[0];
+    } catch (e) {
+      send({type: 'last-position-resolved', mode: 'signature', matches: 0,
+            error: String(e)});
+      send({type: 'hook-error', name: 'last-position.reset', error: String(e)});
+      return false;
+    }
+  }
+  try {
+    Interceptor.attach(target, {
+      onLeave(retval) {
+        try {
+          const position = retval;
+          if (!position || position.isNull()) return;
+          const oldItem = position.add(8).readS64().toString();
+          position.add(8).writeS64(0);
+          const cfi = position.add(16);
+          const capacity = cfi.add(24).readU64().toNumber();
+          if (capacity <= 0x1000000) {
+            if (capacity <= 15) {
+              cfi.writeU8(0);
+            } else {
+              const data = cfi.readPointer();
+              if (data && !data.isNull()) data.writeU8(0);
+            }
+            cfi.add(16).writeU64(0);
+          }
+          send({type: 'last-position-reset', oldItem: oldItem});
+        } catch (e) {
+          send({type: 'hook-error', name: 'last-position.reset', error: String(e)});
+        }
+      }
+    });
+    send({type: 'hook-installed', name: 'last-position.reset',
+          address: target.toString()});
+    return true;
+  } catch (e) {
+    send({type: 'hook-error', name: 'last-position.reset', error: String(e)});
+    return false;
+  }
 }
 
 function installNetHooks() {
@@ -648,6 +725,7 @@ send({
   traverse: navigationEnabled,
   order: navigationOrder
 });
+installLastPositionReset();
 installLoadJobRead();
 let netReady = installNetHooks();
 let qtReady = installQtHooks();
@@ -693,6 +771,7 @@ class NavigationState:
     initial_page: int | None = None
     load_job_matches: int | None = None
     load_job_hooked: bool | None = None
+    last_position_hooked: bool | None = None
     jumps: list[int] = field(default_factory=list)
 
 
@@ -837,20 +916,19 @@ class ResourceWriter:
         ]
 
 
-def validate_navigation(page_count: int | None, jumps: list[int],
-                        captured_pages: int,
-                        initial_page: int | None = None) -> None:
-    """Reject stale startup state, missing pages, or out-of-order navigation."""
+def validate_navigation_coverage(page_count: int | None, jumps: list[int],
+                                  initial_page: int | None) -> None:
+    """Require a complete forward logical-page traversal."""
     if page_count is None:
         return
     if initial_page is None:
         raise RuntimeError("viewer did not report its initial page")
+    if page_count <= 0:
+        raise RuntimeError(f"invalid viewer page count: {page_count}")
     if not 0 <= initial_page < page_count:
         raise RuntimeError(
             f"invalid viewer initial page {initial_page} for {page_count} pages"
         )
-    if page_count <= 0:
-        raise RuntimeError(f"invalid viewer page count: {page_count}")
     observed: list[int] = []
     seen: set[int] = set()
     for page in jumps:
@@ -863,6 +941,15 @@ def validate_navigation(page_count: int | None, jumps: list[int],
             f"navigation coverage is not forward-complete: "
             f"observed {len(observed)} unique jumps, expected {page_count}"
         )
+
+
+def validate_navigation(page_count: int | None, jumps: list[int],
+                        captured_pages: int,
+                        initial_page: int | None = None) -> None:
+    """Reject stale startup state, missing pages, or out-of-order navigation."""
+    validate_navigation_coverage(page_count, jumps, initial_page)
+    if page_count is None:
+        return
     if captured_pages != page_count:
         raise RuntimeError(
             f"captured {captured_pages} unique page resources, "
@@ -1019,18 +1106,22 @@ def _epub_mime(relative: str) -> str:
     }.get(suffix, "application/octet-stream")
 
 
-def _epub_resource_rank(resource: CapturedResource) -> tuple[int, int, int]:
+def _epub_resource_rank(resource: CapturedResource) -> tuple[int, int, int, int]:
+    phase_rank = 0 if resource.page >= 0 else 1
     source_rank = {
         "load_job.ReadRawData": 0,
         "net.URLRequest.Read": 1,
     }.get(resource.source, 2)
-    return source_rank, -resource.size, resource.sequence
+    return phase_rank, source_rank, -resource.size, resource.sequence
 
 
-def _epub_resources(resources: list[CapturedResource]) -> dict[str, CapturedResource]:
+def _epub_resources(resources: list[CapturedResource],
+                    drop_startup: bool = False,
+                    reorder_startup: bool = False) -> dict[str, CapturedResource]:
     selected: dict[str, CapturedResource] = {}
     for resource in sorted(resources, key=lambda item: item.sequence):
-        if not resource.url or not resource.path.exists():
+        if (not resource.url or not resource.path.exists() or
+                (drop_startup and resource.page < 0)):
             continue
         relative = _epub_relative_path(resource.url)
         if relative is None:
@@ -1038,7 +1129,16 @@ def _epub_resources(resources: list[CapturedResource]) -> dict[str, CapturedReso
         current = selected.get(relative)
         if current is None or _epub_resource_rank(resource) < _epub_resource_rank(current):
             selected[relative] = resource
-    return selected
+
+    def order(item: tuple[str, CapturedResource]) -> tuple[int, int, str]:
+        relative, resource = item
+        if resource.page >= 0:
+            sequence = -resource.sequence if reorder_startup else resource.sequence
+            return 0, sequence, relative
+        sequence = -resource.sequence if reorder_startup else resource.sequence
+        return 1, sequence, relative
+
+    return dict(sorted(selected.items(), key=order))
 
 
 def _epub_title(resources: dict[str, CapturedResource], documents: list[str]) -> str:
@@ -1073,10 +1173,58 @@ def _epub_nav(title: str, documents: list[str]) -> bytes:
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
+def _epub_ncx(title: str, identifier: str, documents: list[str]) -> bytes:
+    namespace = "http://www.daisy.org/z3986/2005/ncx/"
+    ET.register_namespace("", namespace)
+    root = ET.Element(f"{{{namespace}}}ncx", {"version": "2005-1"})
+    head = ET.SubElement(root, f"{{{namespace}}}head")
+    ET.SubElement(
+        head, f"{{{namespace}}}meta",
+        {"name": "dtb:uid", "content": identifier},
+    )
+    ET.SubElement(
+        head, f"{{{namespace}}}meta",
+        {"name": "dtb:depth", "content": "1"},
+    )
+    ET.SubElement(
+        head, f"{{{namespace}}}meta",
+        {"name": "dtb:totalPageCount", "content": "0"},
+    )
+    ET.SubElement(
+        head, f"{{{namespace}}}meta",
+        {"name": "dtb:maxPageNumber", "content": "0"},
+    )
+    doc_title = ET.SubElement(root, f"{{{namespace}}}docTitle")
+    ET.SubElement(doc_title, f"{{{namespace}}}text").text = title
+    nav_map = ET.SubElement(root, f"{{{namespace}}}navMap")
+    for index, relative in enumerate(documents, 1):
+        point = ET.SubElement(
+            nav_map,
+            f"{{{namespace}}}navPoint",
+            {"id": f"navpoint-{index}", "playOrder": str(index)},
+        )
+        label = ET.SubElement(point, f"{{{namespace}}}navLabel")
+        ET.SubElement(label, f"{{{namespace}}}text").text = str(index)
+        ET.SubElement(point, f"{{{namespace}}}content", {"src": relative})
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _zip_directories(names: list[str]) -> list[str]:
+    directories: set[str] = set()
+    for name in names:
+        parent = posixpath.dirname(name)
+        while parent:
+            directories.add(parent + "/")
+            parent = posixpath.dirname(parent)
+    return sorted(directories)
+
+
 def export_epub(resources: list[CapturedResource], destination: Path,
-                book: Path, fixed_layout: bool = False) -> Path:
+                book: Path, fixed_layout: bool = False,
+                drop_startup: bool = False,
+                reorder_startup: bool = False) -> Path:
     """Rebuild the EPUB resources exposed by the Reader's resource protocol."""
-    selected = _epub_resources(resources)
+    selected = _epub_resources(resources, drop_startup, reorder_startup)
     documents = [
         relative for relative in selected
         if PurePosixPath(relative).suffix.casefold() in {".xhtml", ".html"}
@@ -1098,10 +1246,11 @@ def export_epub(resources: list[CapturedResource], destination: Path,
     package = ET.Element(f"{{{opf_ns}}}package", package_attributes)
     metadata = ET.SubElement(package, f"{{{opf_ns}}}metadata")
     title = _epub_title(selected, documents)
+    identifier_text = book.stem
     ET.SubElement(metadata, f"{{{dc_ns}}}title").text = title
     ET.SubElement(metadata, f"{{{dc_ns}}}language").text = "ja"
     identifier = ET.SubElement(metadata, f"{{{dc_ns}}}identifier", {"id": "pub-id"})
-    identifier.text = book.stem
+    identifier.text = identifier_text
     ET.SubElement(
         metadata,
         f"{{{opf_ns}}}meta",
@@ -1115,14 +1264,38 @@ def export_epub(resources: list[CapturedResource], destination: Path,
             f"{{{opf_ns}}}meta",
             {"property": "rendition:layout"},
         ).text = "pre-paginated"
+    cover_relative = next(
+        (
+            relative for relative in selected
+            if PurePosixPath(relative).name.casefold() in {
+                "cover.jpg", "cover.jpeg", "cover.png", "cover.gif",
+                "cover.webp", "cover.svg",
+            }
+        ),
+        None,
+    )
+    if fixed_layout and cover_relative is None:
+        cover_relative = next(
+            (
+                relative for relative in selected
+                if relative.startswith("image/page-0001.")
+            ),
+            None,
+        )
+    cover_id = None
+    if cover_relative is not None:
+        cover_id = f"item-{list(selected).index(cover_relative) + 1}"
+        ET.SubElement(
+            metadata,
+            f"{{{opf_ns}}}meta",
+            {"name": "cover", "content": cover_id},
+        )
     manifest = ET.SubElement(package, f"{{{opf_ns}}}manifest")
     ids: dict[str, str] = {}
     for index, relative in enumerate(selected, 1):
         item_id = f"item-{index}"
         ids[relative] = item_id
-        properties = ""
-        if PurePosixPath(relative).name.casefold() in {"cover.jpg", "cover.jpeg", "cover.png"}:
-            properties = "cover-image"
+        properties = "cover-image" if relative == cover_relative else ""
         attributes = {
             "id": item_id,
             "href": relative,
@@ -1137,7 +1310,16 @@ def export_epub(resources: list[CapturedResource], destination: Path,
         {"id": "nav", "href": "nav.xhtml", "media-type": "application/xhtml+xml",
          "properties": "nav"},
     )
-    spine = ET.SubElement(package, f"{{{opf_ns}}}spine", {"page-progression-direction": "rtl"})
+    ET.SubElement(
+        manifest,
+        f"{{{opf_ns}}}item",
+        {"id": "ncx", "href": "toc.ncx", "media-type": "application/x-dtbncx+xml"},
+    )
+    spine = ET.SubElement(
+        package,
+        f"{{{opf_ns}}}spine",
+        {"page-progression-direction": "rtl", "toc": "ncx"},
+    )
     for relative in documents:
         ET.SubElement(spine, f"{{{opf_ns}}}itemref", {"idref": ids[relative]})
 
@@ -1152,6 +1334,7 @@ def export_epub(resources: list[CapturedResource], destination: Path,
     container_bytes = ET.tostring(container, encoding="utf-8", xml_declaration=True)
     opf_bytes = ET.tostring(package, encoding="utf-8", xml_declaration=True)
     nav_bytes = _epub_nav(title, documents)
+    ncx_bytes = _epub_ncx(title, identifier_text, documents)
 
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1160,9 +1343,19 @@ def export_epub(resources: list[CapturedResource], destination: Path,
     try:
         with zipfile.ZipFile(temporary, "w") as archive:
             archive.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+            names = [
+                "META-INF/container.xml",
+                "OEBPS/content.opf",
+                "OEBPS/nav.xhtml",
+                "OEBPS/toc.ncx",
+                *(f"OEBPS/{relative}" for relative in selected),
+            ]
+            for directory in _zip_directories(names):
+                archive.writestr(directory, b"", zipfile.ZIP_STORED)
             archive.writestr("META-INF/container.xml", container_bytes, zipfile.ZIP_DEFLATED)
             archive.writestr("OEBPS/content.opf", opf_bytes, zipfile.ZIP_DEFLATED)
             archive.writestr("OEBPS/nav.xhtml", nav_bytes, zipfile.ZIP_DEFLATED)
+            archive.writestr("OEBPS/toc.ncx", ncx_bytes, zipfile.ZIP_DEFLATED)
             for relative, resource in selected.items():
                 archive.write(resource.path, f"OEBPS/{relative}", zipfile.ZIP_DEFLATED)
         temporary.replace(destination)
@@ -1173,12 +1366,15 @@ def export_epub(resources: list[CapturedResource], destination: Path,
 
 
 def export_fixed_epub(resources: list[CapturedResource], destination: Path,
-                       book: Path, page_count: int | None = None) -> Path:
+                       book: Path, page_count: int | None = None,
+                       initial_page: int | None = None) -> Path:
     """Package fixed-layout page images as a standard EPUB publication."""
     candidates = [
         resource for resource in _page_resources(resources)
         if resource_kind(resource.path) is not None
     ]
+    if initial_page is not None and initial_page != 0:
+        candidates = [resource for resource in candidates if resource.page >= 0]
     if page_count is not None and page_count > 0:
         if len(candidates) == page_count + 1:
             # The restored page is painted before the first controlled jump.
@@ -1418,17 +1614,23 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
             "hook-installed", "hook-missing", "hook-error", "capture-ready",
             "hooks-ready", "qt-hooks-ready", "navigation-ready", "navigation-missing",
             "navigation-error", "navigation-canvas", "navigation-retry",
+            "last-position-resolved", "last-position-reset",
             "url-metadata-ready", "url-request", "url-job",
         }:
-            if kind in {"hook-installed", "hook-missing", "hook-error"} and \
-                    payload.get("name") == "load_job.ReadRawData":
-                navigation.load_job_hooked = kind == "hook-installed"
+            if kind in {"hook-installed", "hook-missing", "hook-error"}:
+                name = payload.get("name")
+                if name == "load_job.ReadRawData":
+                    navigation.load_job_hooked = kind == "hook-installed"
+                elif name == "last-position.reset":
+                    navigation.last_position_hooked = kind == "hook-installed"
             print(f"[{kind}] {payload}", flush=True)
 
     source = (
         JS.replace("__MODE__", mode)
         .replace("__LOAD_JOB_RVA__", "null" if load_job_rva is None else hex(load_job_rva))
+        .replace("__LAST_POSITION_RVA__", "null" if load_job_rva is None else hex(LAST_POSITION_RVA))
         .replace("__LOAD_JOB_SIGNATURE__", LOAD_JOB_READ_RAW_SIGNATURE)
+        .replace("__LAST_POSITION_SIGNATURE__", LAST_POSITION_SIGNATURE)
         .replace("__TRAVERSE__", "true" if traverse else "false")
         .replace("__NAV_WAIT_MS__", str(wait_ms))
     )
@@ -1483,6 +1685,8 @@ def wait_for_resources(writer: ResourceWriter, settle_seconds: float,
             )
         if navigation.load_job_hooked is False:
             raise RuntimeError("load_job.ReadRawData hook was not installed")
+        if navigation.last_position_hooked is False:
+            raise RuntimeError("last-position reset hook was not installed")
 
         if navigation.done.is_set() and writer.chunks and \
                 time.monotonic() - writer.last_message >= settle_seconds:
@@ -1523,7 +1727,7 @@ def main(argv: list[str] | None = None) -> int:
         print("book must end in .dmmb, .dmme, or .dmmr", file=sys.stderr)
         return 2
     epub_mode = suffix in EPUB_SUFFIXES
-    traverse = suffix in {".dmmb", ".dmme"} and not args.no_traverse
+    traverse = not args.no_traverse
     if not book.is_file():
         print(f"book not found: {book}", file=sys.stderr)
         return 2
@@ -1579,13 +1783,26 @@ def main(argv: list[str] | None = None) -> int:
     try:
         resources = writer.resources()
         if epub_mode:
-            if suffix == ".dmme" and not _epub_resources(resources):
+            if traverse:
+                validate_navigation_coverage(
+                    navigation.page_count,
+                    navigation.jumps,
+                    navigation.initial_page,
+                )
+            if suffix == ".dmme":
                 output = export_fixed_epub(
                     resources, out_dir / f"{book.stem}.epub", book,
                     navigation.page_count,
+                    navigation.initial_page,
                 )
             else:
-                output = export_epub(resources, out_dir / f"{book.stem}.epub", book)
+                reorder_startup = (
+                    traverse and navigation.initial_page not in (None, 0)
+                )
+                output = export_epub(
+                    resources, out_dir / f"{book.stem}.epub", book,
+                    reorder_startup=reorder_startup,
+                )
         else:
             pages = export_images(resources, out_dir, navigation.initial_page)
             validate_navigation(
