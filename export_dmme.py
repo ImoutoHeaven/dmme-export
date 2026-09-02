@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import os
+import posixpath
 import queue
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from PIL import Image
 
@@ -22,9 +28,31 @@ VIEWER_SHA256 = "edfac9ac051fdb6726dcc77168d661f546c062e64b3e05af405f2b2bf71cfd5
 LOAD_JOB_READ_RAW_RVA = 0x8B340
 # The tail-jump displacement is link-dependent; the invariant prefix ends at E9.
 LOAD_JOB_READ_RAW_SIGNATURE = "45 89 01 48 8B 89 18 01 00 00 4D 8B C1 E9"
+EPUB_SUFFIXES = {".dmme", ".dmmr"}
+SUPPORTED_SUFFIXES = EPUB_SUFFIXES | {".dmmb"}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PAGE_RESOURCE_SOURCE = "qt.QPixmap.loadFromData"
 MIN_PAGE_AREA = 500_000
+IMAGE_EXTENSIONS = {
+    "jpeg": "jpg",
+    "png": "png",
+    "gif": "gif",
+    "webp": "webp",
+    "bmp": "bmp",
+    "tiff": "tiff",
+    "ico": "ico",
+    "jp2": "jp2",
+    "j2k": "j2k",
+    "jpx": "jpx",
+    "tga": "tga",
+    "dds": "dds",
+    "ppm": "ppm",
+    "pgm": "pgm",
+    "pbm": "pbm",
+    "pcx": "pcx",
+    "xbm": "xbm",
+    "avif": "avif",
+}
 
 # Qt QIODevice is the active book path in this viewer build. The URLRequest
 # hooks remain useful for a build or resource that uses Chromium's loader.
@@ -103,7 +131,7 @@ function installLoadJobRead() {
     const target = main.base.add(rva);
     send({type: 'load-job-resolved', mode: 'rva', matches: 1,
           address: target.toString()});
-    return installRead('load_job.ReadRawData', target);
+    return installURLRead('load_job.ReadRawData', target);
   }
   try {
     const matches = [];
@@ -127,7 +155,7 @@ function installLoadJobRead() {
           matches: matches.length,
           addresses: matches.map(function(address) { return address.toString(); })});
     if (matches.length !== 1) return false;
-    return installRead('load_job.ReadRawData', matches[0]);
+    return installURLRead('load_job.ReadRawData', matches[0]);
   } catch (e) {
     send({type: 'load-job-resolved', mode: 'signature', matches: 0,
           error: String(e)});
@@ -153,27 +181,30 @@ function installURLRead(name, target) {
         this.owner = args[0].toString();
         this.sequence = callSequence++;
       },
-      onLeave(retval) {
+      onLeave(_) {
         try {
+          if (!this.bytesRead || this.bytesRead.isNull()) return;
           const n = this.bytesRead.readS32();
           if (n > 0 && n <= MAX_CHUNK && this.buffer && !this.buffer.isNull()) {
-            const data = this.buffer.add(Process.pointerSize).readPointer();
+            const data = this.buffer.add(16).readPointer();
             if (data && !data.isNull()) {
               send({
                 type: 'resource-chunk',
                 source: name,
                 owner: this.owner,
+                url: urlForOwner(this.owner),
                 sequence: this.sequence,
                 requested: this.capacity,
                 size: n
               }, data.readByteArray(n));
             }
           }
-          if (retval.toInt32() === 0) {
+          if (n <= 0) {
             send({
               type: 'resource-eof',
               source: name,
               owner: this.owner,
+              url: urlForOwner(this.owner),
               sequence: this.sequence
             });
           }
@@ -270,8 +301,73 @@ function installBoundary(name, target, type) {
   }
 }
 
+const requestUrls = new Map();
+const jobUrls = new Map();
+let urlMetadataInstalled = false;
+
+function readStdString(object) {
+  try {
+    if (!object || object.isNull()) return '';
+    const size = object.add(16).readU64().toNumber();
+    const capacity = object.add(24).readU64().toNumber();
+    if (size > 16384 || capacity > 0x1000000) return '';
+    const data = capacity <= 15 ? object : object.readPointer();
+    if (!data || data.isNull()) return '';
+    return data.readUtf8String(size) || '';
+  } catch (_) { return ''; }
+}
+
+function readGURLSpec(gurl) {
+  try {
+    const module = Process.findModuleByName('url_lib.dll');
+    const address = module && module.findExportByName(
+      '?spec@GURL@@QEBAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ'
+    );
+    if (!address) return '';
+    const spec = new NativeFunction(address, 'pointer', ['pointer'])(gurl);
+    return readStdString(spec);
+  } catch (_) { return ''; }
+}
+
+function urlForOwner(owner) {
+  return requestUrls.get(owner) || jobUrls.get(owner) || '';
+}
+
+function installURLMetadata() {
+  if (urlMetadataInstalled) return true;
+  const requestCtor = findModuleExport('net.dll',
+    '??0URLRequest@net@@QEAA@AEBVGURL@@W4RequestPriority@1@PEAVDelegate@01@PEBVURLRequestContext@1@@Z'
+  );
+  const jobCtor = findModuleExport('net.dll',
+    '??0URLRequestJob@net@@QEAA@PEAVURLRequest@1@PEAVNetworkDelegate@1@@Z'
+  );
+  if (requestCtor) {
+    Interceptor.attach(requestCtor, {
+      onEnter(args) {
+        const owner = args[0].toString();
+        const url = readGURLSpec(args[1]);
+        requestUrls.set(owner, url);
+      }
+    });
+  }
+  if (jobCtor) {
+    Interceptor.attach(jobCtor, {
+      onEnter(args) {
+        const owner = args[0].toString();
+        const request = args[1].toString();
+        jobUrls.set(owner, requestUrls.get(request) || '');
+      }
+    });
+  }
+  urlMetadataInstalled = !!requestCtor || !!jobCtor;
+  send({type: 'url-metadata-ready', requestCtor: !!requestCtor,
+        jobCtor: !!jobCtor});
+  return urlMetadataInstalled;
+}
+
 function installNetHooks() {
   if (!Process.findModuleByName('net.dll')) return false;
+  installURLMetadata();
   installURLRead('net.URLRequestJob.ReadRawData', findExport(
     '?ReadRawData@URLRequestJob@net@@MEAA_NPEAVIOBuffer@2@HPEAH@Z'
   ));
@@ -574,6 +670,7 @@ class CapturedResource:
     size: int
     source: str
     page: int = -1
+    url: str = ""
 
 
 @dataclass
@@ -585,6 +682,7 @@ class _ResourceState:
     handle: Any
     digest: Any
     page: int = -1
+    url: str = ""
     size: int = 0
 
 
@@ -659,6 +757,7 @@ class ResourceWriter:
             handle=path.open("wb"),
             digest=hashlib.sha256(),
             page=int(message.get("page", -1)),
+            url=str(message.get("url", "")),
         )
         self._states.append(state)
         self._active[state.key] = state
@@ -690,12 +789,18 @@ class ResourceWriter:
                     self._finish(self._active.get(self._key(message)))
                 else:
                     state = self._active.get(self._key(message))
+                    if state is not None and message.get("url") and state.url and \
+                            str(message["url"]) != state.url:
+                        self._finish(state)
+                        state = None
                     if state is None:
                         state = self._new_state(message)
                     if state.size == 0:
                         state.sequence = int(message["sequence"])
                         state.source = str(message["source"])
                         state.page = int(message.get("page", -1))
+                    if message.get("url"):
+                        state.url = str(message["url"])
                     state.handle.write(payload)
                     state.digest.update(payload)
                     state.size += len(payload)
@@ -725,6 +830,7 @@ class ResourceWriter:
                 size=state.size,
                 source=state.source,
                 page=state.page,
+                url=state.url,
             )
             for state in self._states
             if state.size and state.path.exists()
@@ -775,16 +881,12 @@ def resource_kind(path: Path) -> str | None:
         return "gif"
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "webp"
-    return None
-
-
-def _valid_image(path: Path) -> bool:
     try:
         with Image.open(path) as image:
-            image.verify()
-        return True
+            kind = (image.format or "").casefold()
+        return kind if kind in IMAGE_EXTENSIONS else None
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def _image_size(path: Path) -> tuple[int, int] | None:
@@ -820,35 +922,25 @@ def _page_resources(resources: list[CapturedResource]) -> list[CapturedResource]
     ]
 
 
-def _write_png(resource: CapturedResource, destination: Path) -> bool:
-    kind = resource_kind(resource.path)
-    if kind is None or not _valid_image(resource.path):
+def _copy_image(resource: CapturedResource, destination: Path) -> bool:
+    if resource_kind(resource.path) is None:
         return False
-    if kind == "png":
+    try:
         shutil.copyfile(resource.path, destination)
         return True
-    try:
-        with Image.open(resource.path) as image:
-            image.load()
-            if image.mode == "CMYK":
-                image = image.convert("RGB")
-            image.save(destination, format="PNG")
-        return True
-    except (OSError, ValueError):
+    except OSError:
         destination.unlink(missing_ok=True)
         return False
 
 
 def export_images(resources: list[CapturedResource], out_dir: Path,
                   initial_page: int | None = None) -> list[Path]:
-    """Write logical-page resources in forward order.
-
-    Identical bytes on different logical pages are valid and are retained.
-    """
+    """Write logical-page resources in forward order, preserving image bytes."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("page_*.png"):
-        old.unlink()
+    for old in out_dir.glob("page_*"):
+        if old.is_file():
+            old.unlink()
 
     if initial_page is not None and initial_page != 0:
         # The viewer can restore a prior spread before navigation is attached.
@@ -870,13 +962,298 @@ def export_images(resources: list[CapturedResource], out_dir: Path,
         key = (page, resource.sha256)
         if key in seen:
             continue
-        destination = out_dir / f"page_{len(pages) + 1:03d}.png"
-        if _write_png(resource, destination):
+        kind = resource_kind(resource.path)
+        if kind is None:
+            continue
+        destination = out_dir / (
+            f"page_{len(pages) + 1:03d}.{IMAGE_EXTENSIONS[kind]}"
+        )
+        if _copy_image(resource, destination):
             seen.add(key)
             pages.append(destination)
         else:
             destination.unlink(missing_ok=True)
     return pages
+
+
+def _epub_relative_path(url: str) -> str | None:
+    try:
+        path = unquote(urlsplit(url).path)
+    except ValueError:
+        return None
+    prefix = "/item/"
+    if not path.startswith(prefix):
+        return None
+    relative = posixpath.normpath(path[len(prefix):])
+    if (not relative or relative in {".", ".."} or relative.startswith("../")
+            or relative.startswith("/") or "\\" in relative):
+        return None
+    return relative
+
+
+def _epub_mime(relative: str) -> str:
+    suffix = PurePosixPath(relative).suffix.casefold()
+    return {
+        ".xhtml": "application/xhtml+xml",
+        ".html": "application/xhtml+xml",
+        ".css": "text/css",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+        ".jp2": "image/jp2",
+        ".j2k": "image/jp2",
+        ".jpx": "image/jp2",
+        ".avif": "image/avif",
+        ".svg": "image/svg+xml",
+        ".ttf": "font/ttf",
+        ".otf": "font/otf",
+        ".woff": "font/woff",
+        ".woff2": "font/woff2",
+        ".js": "text/javascript",
+        ".xml": "application/xml",
+    }.get(suffix, "application/octet-stream")
+
+
+def _epub_resource_rank(resource: CapturedResource) -> tuple[int, int, int]:
+    source_rank = {
+        "load_job.ReadRawData": 0,
+        "net.URLRequest.Read": 1,
+    }.get(resource.source, 2)
+    return source_rank, -resource.size, resource.sequence
+
+
+def _epub_resources(resources: list[CapturedResource]) -> dict[str, CapturedResource]:
+    selected: dict[str, CapturedResource] = {}
+    for resource in sorted(resources, key=lambda item: item.sequence):
+        if not resource.url or not resource.path.exists():
+            continue
+        relative = _epub_relative_path(resource.url)
+        if relative is None:
+            continue
+        current = selected.get(relative)
+        if current is None or _epub_resource_rank(resource) < _epub_resource_rank(current):
+            selected[relative] = resource
+    return selected
+
+
+def _epub_title(resources: dict[str, CapturedResource], documents: list[str]) -> str:
+    for relative in documents:
+        try:
+            root = ET.fromstring(resources[relative].path.read_bytes())
+        except (ET.ParseError, OSError):
+            continue
+        for element in root.iter():
+            if isinstance(element.tag, str) and element.tag.rsplit("}", 1)[-1] == "title":
+                title = " ".join("".join(element.itertext()).split())
+                if title:
+                    return title
+    return "DMM book"
+
+
+def _epub_nav(title: str, documents: list[str]) -> bytes:
+    xhtml = "http://www.w3.org/1999/xhtml"
+    epub = "http://www.idpf.org/2007/ops"
+    ET.register_namespace("", xhtml)
+    ET.register_namespace("epub", epub)
+    root = ET.Element(f"{{{xhtml}}}html", {"{http://www.w3.org/XML/1998/namespace}lang": "ja"})
+    head = ET.SubElement(root, f"{{{xhtml}}}head")
+    ET.SubElement(head, f"{{{xhtml}}}title").text = title
+    body = ET.SubElement(root, f"{{{xhtml}}}body")
+    nav = ET.SubElement(body, f"{{{xhtml}}}nav", {f"{{{epub}}}type": "toc"})
+    ET.SubElement(nav, f"{{{xhtml}}}h1").text = title
+    ordered = ET.SubElement(nav, f"{{{xhtml}}}ol")
+    for index, relative in enumerate(documents, 1):
+        item = ET.SubElement(ordered, f"{{{xhtml}}}li")
+        ET.SubElement(item, f"{{{xhtml}}}a", {"href": relative}).text = str(index)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def export_epub(resources: list[CapturedResource], destination: Path,
+                book: Path, fixed_layout: bool = False) -> Path:
+    """Rebuild the EPUB resources exposed by the Reader's resource protocol."""
+    selected = _epub_resources(resources)
+    documents = [
+        relative for relative in selected
+        if PurePosixPath(relative).suffix.casefold() in {".xhtml", ".html"}
+    ]
+    if not documents:
+        raise RuntimeError("no EPUB document resources captured; keep resources for diagnosis")
+
+    opf_ns = "http://www.idpf.org/2007/opf"
+    dc_ns = "http://purl.org/dc/elements/1.1/"
+    container_ns = "urn:oasis:names:tc:opendocument:xmlns:container"
+    ET.register_namespace("", opf_ns)
+    ET.register_namespace("dc", dc_ns)
+    ET.register_namespace("dcterms", "http://purl.org/dc/terms/")
+    package_attributes = {"version": "3.0", "unique-identifier": "pub-id"}
+    if fixed_layout:
+        package_attributes["prefix"] = (
+            "rendition: http://www.idpf.org/vocab/rendition/#"
+        )
+    package = ET.Element(f"{{{opf_ns}}}package", package_attributes)
+    metadata = ET.SubElement(package, f"{{{opf_ns}}}metadata")
+    title = _epub_title(selected, documents)
+    ET.SubElement(metadata, f"{{{dc_ns}}}title").text = title
+    ET.SubElement(metadata, f"{{{dc_ns}}}language").text = "ja"
+    identifier = ET.SubElement(metadata, f"{{{dc_ns}}}identifier", {"id": "pub-id"})
+    identifier.text = book.stem
+    ET.SubElement(
+        metadata,
+        f"{{{opf_ns}}}meta",
+        {"property": "dcterms:modified"},
+    ).text = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+    if fixed_layout:
+        ET.SubElement(
+            metadata,
+            f"{{{opf_ns}}}meta",
+            {"property": "rendition:layout"},
+        ).text = "pre-paginated"
+    manifest = ET.SubElement(package, f"{{{opf_ns}}}manifest")
+    ids: dict[str, str] = {}
+    for index, relative in enumerate(selected, 1):
+        item_id = f"item-{index}"
+        ids[relative] = item_id
+        properties = ""
+        if PurePosixPath(relative).name.casefold() in {"cover.jpg", "cover.jpeg", "cover.png"}:
+            properties = "cover-image"
+        attributes = {
+            "id": item_id,
+            "href": relative,
+            "media-type": _epub_mime(relative),
+        }
+        if properties:
+            attributes["properties"] = properties
+        ET.SubElement(manifest, f"{{{opf_ns}}}item", attributes)
+    ET.SubElement(
+        manifest,
+        f"{{{opf_ns}}}item",
+        {"id": "nav", "href": "nav.xhtml", "media-type": "application/xhtml+xml",
+         "properties": "nav"},
+    )
+    spine = ET.SubElement(package, f"{{{opf_ns}}}spine", {"page-progression-direction": "rtl"})
+    for relative in documents:
+        ET.SubElement(spine, f"{{{opf_ns}}}itemref", {"idref": ids[relative]})
+
+    container = ET.Element(f"{{{container_ns}}}container", {"version": "1.0"})
+    rootfiles = ET.SubElement(container, f"{{{container_ns}}}rootfiles")
+    ET.SubElement(
+        rootfiles,
+        f"{{{container_ns}}}rootfile",
+        {"full-path": "OEBPS/content.opf", "media-type": "application/oebps-package+xml"},
+    )
+    ET.register_namespace("", container_ns)
+    container_bytes = ET.tostring(container, encoding="utf-8", xml_declaration=True)
+    opf_bytes = ET.tostring(package, encoding="utf-8", xml_declaration=True)
+    nav_bytes = _epub_nav(title, documents)
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(str(destination) + ".part")
+    temporary.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(temporary, "w") as archive:
+            archive.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+            archive.writestr("META-INF/container.xml", container_bytes, zipfile.ZIP_DEFLATED)
+            archive.writestr("OEBPS/content.opf", opf_bytes, zipfile.ZIP_DEFLATED)
+            archive.writestr("OEBPS/nav.xhtml", nav_bytes, zipfile.ZIP_DEFLATED)
+            for relative, resource in selected.items():
+                archive.write(resource.path, f"OEBPS/{relative}", zipfile.ZIP_DEFLATED)
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return destination
+
+
+def export_fixed_epub(resources: list[CapturedResource], destination: Path,
+                       book: Path, page_count: int | None = None) -> Path:
+    """Package fixed-layout page images as a standard EPUB publication."""
+    candidates = [
+        resource for resource in _page_resources(resources)
+        if resource_kind(resource.path) is not None
+    ]
+    if page_count is not None and page_count > 0:
+        if len(candidates) == page_count + 1:
+            # The restored page is painted before the first controlled jump.
+            candidates = candidates[1:]
+        if len(candidates) != page_count:
+            raise RuntimeError(
+                f"captured {len(candidates)} fixed-layout pages, "
+                f"viewer reported {page_count}"
+            )
+        candidates = sorted(candidates, key=lambda resource: resource.sequence)
+    if not candidates:
+        raise RuntimeError("no fixed-layout page images captured; keep resources for diagnosis")
+
+    extensions = IMAGE_EXTENSIONS
+    xhtml_ns = "http://www.w3.org/1999/xhtml"
+    ET.register_namespace("", xhtml_ns)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        synthetic: list[CapturedResource] = []
+        for index, resource in enumerate(candidates, 1):
+            kind = resource_kind(resource.path)
+            if kind not in extensions:
+                continue
+            extension = extensions[kind]
+            image_relative = f"image/page-{index:04d}.{extension}"
+            document_relative = f"xhtml/page-{index:04d}.xhtml"
+            document_path = root / f"page-{index:04d}.xhtml"
+            document = ET.Element(f"{{{xhtml_ns}}}html")
+            head = ET.SubElement(document, f"{{{xhtml_ns}}}head")
+            ET.SubElement(head, f"{{{xhtml_ns}}}title").text = book.stem
+            width, height = _image_size(resource.path) or (1, 1)
+            ET.SubElement(head, f"{{{xhtml_ns}}}meta", {"charset": "UTF-8"})
+            ET.SubElement(
+                head,
+                f"{{{xhtml_ns}}}meta",
+                {"name": "viewport", "content": f"width={width}, height={height}"},
+            )
+            body = ET.SubElement(
+                document,
+                f"{{{xhtml_ns}}}body",
+                {"style": "margin:0; padding:0;"},
+            )
+            ET.SubElement(
+                body,
+                f"{{{xhtml_ns}}}img",
+                {
+                    "src": f"../{image_relative}",
+                    "alt": "",
+                    "style": "width:100%; height:100%; object-fit:contain;",
+                },
+            )
+            document_path.write_bytes(
+                ET.tostring(document, encoding="utf-8", xml_declaration=True)
+            )
+            synthetic.append(
+                CapturedResource(
+                    path=document_path,
+                    sequence=index * 2 - 2,
+                    sha256=_sha256(document_path),
+                    size=document_path.stat().st_size,
+                    source="load_job.ReadRawData",
+                    url=f"cjh://fixed/item/{document_relative}",
+                )
+            )
+            synthetic.append(
+                CapturedResource(
+                    path=resource.path,
+                    sequence=index * 2 - 1,
+                    sha256=resource.sha256,
+                    size=resource.size,
+                    source=resource.source,
+                    url=f"cjh://fixed/item/{image_relative}",
+                )
+            )
+        return export_epub(synthetic, destination, book, fixed_layout=True)
 
 
 def _sha256(path: Path) -> str:
@@ -896,7 +1273,7 @@ def _association_viewer() -> Path | None:
     except ImportError:
         return None
 
-    for suffix in (".dmme", ".dmmb"):
+    for suffix in (".dmme", ".dmmb", ".dmmr"):
         try:
             with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, suffix) as extension:
                 prog_id, _ = winreg.QueryValueEx(extension, None)
@@ -1041,6 +1418,7 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
             "hook-installed", "hook-missing", "hook-error", "capture-ready",
             "hooks-ready", "qt-hooks-ready", "navigation-ready", "navigation-missing",
             "navigation-error", "navigation-canvas", "navigation-retry",
+            "url-metadata-ready", "url-request", "url-job",
         }:
             if kind in {"hook-installed", "hook-missing", "hook-error"} and \
                     payload.get("name") == "load_job.ReadRawData":
@@ -1140,9 +1518,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     book = args.book.expanduser().resolve()
-    if book.suffix.lower() not in {".dmme", ".dmmb"}:
-        print("book must end in .dmme or .dmmb", file=sys.stderr)
+    suffix = book.suffix.lower()
+    if suffix not in SUPPORTED_SUFFIXES:
+        print("book must end in .dmmb, .dmme, or .dmmr", file=sys.stderr)
         return 2
+    epub_mode = suffix in EPUB_SUFFIXES
+    traverse = suffix in {".dmmb", ".dmme"} and not args.no_traverse
     if not book.is_file():
         print(f"book not found: {book}", file=sys.stderr)
         return 2
@@ -1173,7 +1554,7 @@ def main(argv: list[str] | None = None) -> int:
         device = frida.get_local_device()
         print(f"[open] {book}", flush=True)
         session, pid, navigation = start_capture(
-            device, viewer, book, writer, not args.no_traverse,
+            device, viewer, book, writer, traverse,
             args.navigation_wait_ms, load_job_rva,
         )
         print(f"[pid] {pid}", flush=True)
@@ -1197,18 +1578,33 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         resources = writer.resources()
-        pages = export_images(resources, out_dir, navigation.initial_page)
-        validate_navigation(
-            navigation.page_count,
-            navigation.jumps,
-            len(pages),
-            navigation.initial_page,
-        )
+        if epub_mode:
+            if suffix == ".dmme" and not _epub_resources(resources):
+                output = export_fixed_epub(
+                    resources, out_dir / f"{book.stem}.epub", book,
+                    navigation.page_count,
+                )
+            else:
+                output = export_epub(resources, out_dir / f"{book.stem}.epub", book)
+        else:
+            pages = export_images(resources, out_dir, navigation.initial_page)
+            validate_navigation(
+                navigation.page_count,
+                navigation.jumps,
+                len(pages),
+                navigation.initial_page,
+            )
     except (OSError, RuntimeError) as exc:
-        for page in out_dir.glob("page_*.png"):
-            page.unlink(missing_ok=True)
+        for page in out_dir.glob("page_*"):
+            if page.is_file():
+                page.unlink(missing_ok=True)
         print(f"[fail] {exc}", file=sys.stderr)
         return 1
+    if epub_mode:
+        if not args.keep_resources:
+            shutil.rmtree(resources_dir, ignore_errors=True)
+        print(f"[done] {output}", flush=True)
+        return 0
     if not pages:
         print(f"[fail] no image resources found; inspect {resources_dir}", file=sys.stderr)
         return 1

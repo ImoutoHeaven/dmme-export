@@ -5,6 +5,7 @@ import io
 import os
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 from PIL import Image
@@ -100,10 +101,12 @@ def main() -> None:
 
         pages = ex.export_images(resources, output)
         assert [path.name for path in pages] == [
-            "page_001.png", "page_002.png", "page_003.png", "page_004.png"
+            "page_001.png", "page_002.jpg", "page_003.png", "page_004.png"
         ]
-        assert pages[0].read_bytes() == red, "PNG resources should stay byte-for-byte lossless"
-        assert Image.open(pages[1]).size == (1000, 800), "JPEG resources must decode to PNG"
+        assert pages[0].read_bytes() == red, "PNG resources must stay byte-for-byte unchanged"
+        assert pages[1].read_bytes() == blue, "JPEG resources must stay byte-for-byte unchanged"
+        assert ex.resource_kind(pages[1]) == "jpeg"
+        assert ex._image_size(pages[1]) == (1000, 800), "image inspection must not rewrite bytes"
         assert pages[2].read_bytes() == pages[3].read_bytes(), (
             "identical images on different logical pages must both be retained"
         )
@@ -162,6 +165,85 @@ def main() -> None:
             pass
         else:
             raise AssertionError("out-of-order navigation should fail")
+
+        stream_root = Path(temporary) / "stream-resources"
+        stream_writer = ex.ResourceWriter(stream_root)
+        stream_message = {
+            "source": "net.URLRequest.Read",
+            "owner": "url-owner",
+            "sequence": 20,
+            "url": "cjh://book/item/xhtml/p-stream.xhtml",
+        }
+        stream_writer.submit(stream_message, b"abc")
+        stream_writer.submit({**stream_message, "sequence": 21}, b"def")
+        stream_writer.submit_boundary("resource-eof", stream_message)
+        stream_writer.close()
+        stream_resources = stream_writer.resources()
+        assert len(stream_resources) == 1
+        assert stream_resources[0].path.read_bytes() == b"abcdef"
+        assert stream_resources[0].url.endswith("/p-stream.xhtml")
+
+        html = (
+            b'<?xml version="1.0"?><html '
+            b'xmlns="http://www.w3.org/1999/xhtml"><head><title>Test</title>'
+            b'</head><body><img src="../image/cover.jpg"/></body></html>'
+        )
+        cover = encoded((255, 0, 0), "JPEG", (1200, 800))
+        html_path = Path(temporary) / "epub-html.bin"
+        cover_path = Path(temporary) / "epub-cover.bin"
+        html_path.write_bytes(html)
+        cover_path.write_bytes(cover)
+        epub_resources = [
+            ex.CapturedResource(
+                path=html_path, sequence=30, sha256=ex._sha256(html_path),
+                size=len(html), source="load_job.ReadRawData",
+                url="cjh://book/item/xhtml/p-cover.xhtml",
+            ),
+            ex.CapturedResource(
+                path=cover_path, sequence=31, sha256=ex._sha256(cover_path),
+                size=len(cover), source="load_job.ReadRawData",
+                url="cjh://book/item/image/cover.jpg",
+            ),
+        ]
+        epub_path = ex.export_epub(
+            epub_resources, Path(temporary) / "epub" / "book.epub", Path("book.dmmr")
+        )
+        with zipfile.ZipFile(epub_path) as archive:
+            assert archive.namelist()[0] == "mimetype"
+            assert archive.getinfo("mimetype").compress_type == zipfile.ZIP_STORED
+            assert archive.read("mimetype") == b"application/epub+zip"
+            assert "dcterms:modified" in archive.read("OEBPS/content.opf").decode()
+            assert archive.testzip() is None
+            assert "OEBPS/xhtml/p-cover.xhtml" in archive.namelist()
+            assert "OEBPS/image/cover.jpg" in archive.namelist()
+            assert archive.read("OEBPS/image/cover.jpg") == cover
+
+        assert "this.buffer.add(16).readPointer()" in ex.JS
+        assert "return installURLRead('load_job.ReadRawData', target);" in ex.JS
+
+        fixed_output = ex.export_fixed_epub(
+            [
+                captured(root / "fixed-startup.png", page_three, 20, -1),
+                captured(root / "fixed-page-zero.png", red, 21, 0),
+                captured(root / "fixed-page-one.jpg", blue, 22, 1),
+                captured(root / "fixed-page-two.png", page_two, 23, 3),
+            ],
+            Path(temporary) / "fixed-epub" / "book.epub",
+            Path("book.dmme"),
+            page_count=3,
+        )
+        with zipfile.ZipFile(fixed_output) as archive:
+            assert archive.namelist()[0] == "mimetype"
+            assert archive.getinfo("mimetype").compress_type == zipfile.ZIP_STORED
+            assert archive.testzip() is None
+            assert "dcterms:modified" in archive.read("OEBPS/content.opf").decode()
+            assert len([
+                name for name in archive.namelist()
+                if name.startswith("OEBPS/xhtml/page-")
+            ]) == 3
+            assert "rendition:layout" in archive.read("OEBPS/content.opf").decode()
+            assert archive.read("OEBPS/image/page-0001.png") == red
+            assert archive.read("OEBPS/image/page-0002.jpg") == blue
 
     print("all checks passed")
 
