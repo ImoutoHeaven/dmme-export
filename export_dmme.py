@@ -1712,6 +1712,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--navigation-wait-ms", type=int, default=0)
     parser.add_argument("--no-traverse", action="store_true")
     parser.add_argument("--keep-resources", action="store_true")
+    parser.add_argument(
+        "--dmmb-output",
+        choices=("images", "epub"),
+        default="images",
+        help="for .dmmb: write page images (default) or a fixed-layout EPUB",
+    )
     return parser.parse_args(argv)
 
 
@@ -1726,7 +1732,8 @@ def main(argv: list[str] | None = None) -> int:
     if suffix not in SUPPORTED_SUFFIXES:
         print("book must end in .dmmb, .dmme, or .dmmr", file=sys.stderr)
         return 2
-    epub_mode = suffix in EPUB_SUFFIXES
+    dmmb_epub = suffix == ".dmmb" and args.dmmb_output == "epub"
+    epub_mode = suffix in EPUB_SUFFIXES or dmmb_epub
     traverse = not args.no_traverse
     if not book.is_file():
         print(f"book not found: {book}", file=sys.stderr)
@@ -1789,7 +1796,7 @@ def main(argv: list[str] | None = None) -> int:
                     navigation.jumps,
                     navigation.initial_page,
                 )
-            if suffix == ".dmme":
+            if suffix == ".dmme" or dmmb_epub:
                 output = export_fixed_epub(
                     resources, out_dir / f"{book.stem}.epub", book,
                     navigation.page_count,

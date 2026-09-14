@@ -256,6 +256,13 @@ def main() -> None:
         assert "return installURLRead('load_job.ReadRawData', target);" in ex.JS
         ex.validate_navigation_coverage(307, [0, *range(307)], 306)
 
+        parsed = ex.parse_args([str(Path("book.dmmb"))])
+        assert parsed.dmmb_output == "images"
+        parsed_epub = ex.parse_args(
+            [str(Path("book.dmmb")), "--dmmb-output", "epub"]
+        )
+        assert parsed_epub.dmmb_output == "epub"
+
         fixed_output = ex.export_fixed_epub(
             [
                 captured(root / "fixed-startup.png", page_three, 20, -1),
@@ -283,6 +290,24 @@ def main() -> None:
             assert "rendition:layout" in archive.read("OEBPS/content.opf").decode()
             assert archive.read("OEBPS/image/page-0001.png") == red
             assert archive.read("OEBPS/image/page-0002.jpg") == blue
+
+        dmmb_epub = ex.export_fixed_epub(
+            [
+                captured(root / "dmmb-page-zero.png", red, 30, 0),
+                captured(root / "dmmb-page-one.jpg", blue, 31, 1),
+            ],
+            Path(temporary) / "dmmb-epub" / "s011akamj03006.epub",
+            Path("s011akamj03006.dmmb"),
+            page_count=2,
+            initial_page=0,
+        )
+        with zipfile.ZipFile(dmmb_epub) as archive:
+            assert archive.namelist()[0] == "mimetype"
+            assert archive.getinfo("mimetype").compress_type == zipfile.ZIP_STORED
+            assert archive.testzip() is None
+            assert archive.read("OEBPS/image/page-0001.png") == red
+            assert archive.read("OEBPS/image/page-0002.jpg") == blue
+            assert "rendition:layout" in archive.read("OEBPS/content.opf").decode()
 
     print("all checks passed")
 

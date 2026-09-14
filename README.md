@@ -10,7 +10,8 @@ for the book type.
 - `.dmmb` produces `page_001.<format>`, `page_002.<format>`, and so on in
   forward logical-page order. The suffix is detected from the captured image;
   JPEG remains `.jpg`, PNG remains `.png`, and other supported formats keep
-  their format.
+  their format. `--dmmb-output epub` packs those pages as a fixed-layout
+  `<book-name>.epub`.
 - `.dmme` produces a fixed-layout `<book-name>.epub` built from the captured
   page images.
 - `.dmmr` produces a reflowable `<book-name>.epub` built from captured XHTML,
@@ -48,8 +49,9 @@ uv pip install --python .venv\Scripts\python.exe frida-tools pillow
 
 The output directory is optional. The default is `dump\<book-name>`.
 
-For `.dmmb`, pages are files in the output directory. For `.dmme` and `.dmmr`,
-the generated EPUB is:
+For `.dmmb --dmmb-output images` (default), pages are files in the output
+directory. For `.dmme`, `.dmmr`, and `.dmmb --dmmb-output epub`, the generated
+EPUB is:
 
 ```text
 output\<book-name>.epub
@@ -151,6 +153,8 @@ continue. The hook changes only the returned in-memory `item_index` and CFI.
 --keep-resources       Keep OUT\_resources after a successful export.
 --no-traverse          Disable page navigation for diagnostic resource capture;
                        the resulting export may be incomplete.
+--dmmb-output images|epub
+                       For .dmmb, write page images (default) or a fixed-layout EPUB.
 ```
 
 ## Docker self-check
