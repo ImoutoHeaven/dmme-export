@@ -10,6 +10,7 @@ import posixpath
 import queue
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1141,18 +1142,35 @@ def _epub_resources(resources: list[CapturedResource],
     return dict(sorted(selected.items(), key=order))
 
 
-def _epub_title(resources: dict[str, CapturedResource], documents: list[str]) -> str:
-    for relative in documents:
-        try:
-            root = ET.fromstring(resources[relative].path.read_bytes())
-        except (ET.ParseError, OSError):
-            continue
-        for element in root.iter():
-            if isinstance(element.tag, str) and element.tag.rsplit("}", 1)[-1] == "title":
-                title = " ".join("".join(element.itertext()).split())
-                if title:
-                    return title
-    return "DMM book"
+def bookshelf_title(product_id: str, db_path: Path | None = None) -> str | None:
+    """Read my_library.title for product_Id from the local DMMbookviewer SQLite."""
+    product_id = product_id.strip()
+    if not product_id:
+        return None
+    if db_path is None:
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        db_path = Path(appdata) / "DMM" / "DMMbookviewer2" / "dmmbookshelf.sqlite3"
+    if not db_path.is_file():
+        return None
+    try:
+        with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                "SELECT title FROM my_library WHERE product_Id = ? LIMIT 1",
+                (product_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or not isinstance(row[0], str):
+        return None
+    title = " ".join(row[0].split())
+    return title or None
+
+
+def publication_title(book: Path, db_path: Path | None = None) -> str:
+    """SQLite my_library.title for product_Id, else the book filename stem."""
+    return bookshelf_title(book.stem, db_path) or book.stem
 
 
 def _epub_nav(title: str, documents: list[str]) -> bytes:
@@ -1222,7 +1240,8 @@ def _zip_directories(names: list[str]) -> list[str]:
 def export_epub(resources: list[CapturedResource], destination: Path,
                 book: Path, fixed_layout: bool = False,
                 drop_startup: bool = False,
-                reorder_startup: bool = False) -> Path:
+                reorder_startup: bool = False,
+                title: str | None = None) -> Path:
     """Rebuild the EPUB resources exposed by the Reader's resource protocol."""
     selected = _epub_resources(resources, drop_startup, reorder_startup)
     documents = [
@@ -1245,7 +1264,7 @@ def export_epub(resources: list[CapturedResource], destination: Path,
         )
     package = ET.Element(f"{{{opf_ns}}}package", package_attributes)
     metadata = ET.SubElement(package, f"{{{opf_ns}}}metadata")
-    title = _epub_title(selected, documents)
+    title = (title or "").strip() or book.stem
     identifier_text = book.stem
     ET.SubElement(metadata, f"{{{dc_ns}}}title").text = title
     ET.SubElement(metadata, f"{{{dc_ns}}}language").text = "ja"
@@ -1367,8 +1386,10 @@ def export_epub(resources: list[CapturedResource], destination: Path,
 
 def export_fixed_epub(resources: list[CapturedResource], destination: Path,
                        book: Path, page_count: int | None = None,
-                       initial_page: int | None = None) -> Path:
+                       initial_page: int | None = None,
+                       title: str | None = None) -> Path:
     """Package fixed-layout page images as a standard EPUB publication."""
+    page_title = (title or "").strip() or book.stem
     candidates = [
         resource for resource in _page_resources(resources)
         if resource_kind(resource.path) is not None
@@ -1404,7 +1425,7 @@ def export_fixed_epub(resources: list[CapturedResource], destination: Path,
             document_path = root / f"page-{index:04d}.xhtml"
             document = ET.Element(f"{{{xhtml_ns}}}html")
             head = ET.SubElement(document, f"{{{xhtml_ns}}}head")
-            ET.SubElement(head, f"{{{xhtml_ns}}}title").text = book.stem
+            ET.SubElement(head, f"{{{xhtml_ns}}}title").text = page_title
             width, height = _image_size(resource.path) or (1, 1)
             ET.SubElement(head, f"{{{xhtml_ns}}}meta", {"charset": "UTF-8"})
             ET.SubElement(
@@ -1449,7 +1470,9 @@ def export_fixed_epub(resources: list[CapturedResource], destination: Path,
                     url=f"cjh://fixed/item/{image_relative}",
                 )
             )
-        return export_epub(synthetic, destination, book, fixed_layout=True)
+        return export_epub(
+            synthetic, destination, book, fixed_layout=True, title=page_title,
+        )
 
 
 def _sha256(path: Path) -> str:
@@ -1796,11 +1819,14 @@ def main(argv: list[str] | None = None) -> int:
                     navigation.jumps,
                     navigation.initial_page,
                 )
+            title = publication_title(book)
+            print(f"[title] {title}", flush=True)
             if suffix == ".dmme" or dmmb_epub:
                 output = export_fixed_epub(
                     resources, out_dir / f"{book.stem}.epub", book,
                     navigation.page_count,
                     navigation.initial_page,
+                    title,
                 )
             else:
                 reorder_startup = (
@@ -1809,6 +1835,7 @@ def main(argv: list[str] | None = None) -> int:
                 output = export_epub(
                     resources, out_dir / f"{book.stem}.epub", book,
                     reorder_startup=reorder_startup,
+                    title=title,
                 )
         else:
             pages = export_images(resources, out_dir, navigation.initial_page)

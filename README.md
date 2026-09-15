@@ -17,6 +17,9 @@ for the book type.
 - `.dmmr` produces a reflowable `<book-name>.epub` built from captured XHTML,
   CSS, image, font, and other book resources.
 
+EPUB `dc:title` is `my_library.title` for `product_Id` (the filename stem) in
+`%APPDATA%\DMM\DMMbookviewer2\dmmbookshelf.sqlite3`, or the filename stem.
+
 Captured image and document payloads are copied byte-for-byte. Pillow is used
 only to inspect image format and dimensions. It never saves or converts captured
 images. EPUB image entries may use ZIP DEFLATE, which is lossless container

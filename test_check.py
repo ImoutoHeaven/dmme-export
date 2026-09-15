@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import os
+import sqlite3
 import sys
 import tempfile
 import zipfile
@@ -231,8 +232,19 @@ def main() -> None:
         assert list(reordered) == [
             "image/cover.jpg", "xhtml/p-cover.xhtml", "xhtml/stale.xhtml"
         ]
+        unnamed = ex.export_epub(
+            epub_resources, Path(temporary) / "epub" / "unnamed.epub",
+            Path("k077bscsh09791.dmmr"),
+        )
+        with zipfile.ZipFile(unnamed) as archive:
+            assert "<dc:title>k077bscsh09791</dc:title>" in archive.read(
+                "OEBPS/content.opf"
+            ).decode()
+
         epub_path = ex.export_epub(
-            epub_resources, Path(temporary) / "epub" / "book.epub", Path("book.dmmr")
+            epub_resources, Path(temporary) / "epub" / "book.epub",
+            Path("k077bscsh09791.dmmr"),
+            title="記憶の鍵盤（新潮文庫nex）",
         )
         with zipfile.ZipFile(epub_path) as archive:
             assert archive.namelist()[0] == "mimetype"
@@ -248,12 +260,39 @@ def main() -> None:
             assert "OEBPS/xhtml/p-cover.xhtml" in archive.namelist()
             assert "OEBPS/image/cover.jpg" in archive.namelist()
             assert archive.read("OEBPS/image/cover.jpg") == cover
+            opf = archive.read("OEBPS/content.opf").decode()
+            assert "<dc:title>記憶の鍵盤（新潮文庫nex）</dc:title>" in opf
+            assert "k077bscsh09791" not in archive.read("OEBPS/nav.xhtml").decode()
 
         assert "this.buffer.add(16).readPointer()" in ex.JS
         assert "page: navigationPage" in ex.JS
         assert "position.add(8).writeS64(0)" in ex.JS
         assert "last-position.reset" in ex.JS
         assert "return installURLRead('load_job.ReadRawData', target);" in ex.JS
+        assert "qt.QQuickText.setText" not in ex.JS
+        assert "book-title" not in ex.JS
+
+        shelf = Path(temporary) / "dmmbookshelf.sqlite3"
+        with sqlite3.connect(shelf) as connection:
+            connection.execute(
+                "CREATE TABLE my_library (product_Id TEXT, title TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO my_library VALUES (?, ?)",
+                ("k077bscsh09791", "記憶の鍵盤（新潮文庫nex）"),
+            )
+            connection.execute(
+                "INSERT INTO my_library VALUES (?, ?)",
+                ("s011akamj03006", "月刊メガストア2026年9月号"),
+            )
+        assert ex.bookshelf_title("k077bscsh09791", shelf) == "記憶の鍵盤（新潮文庫nex）"
+        assert ex.bookshelf_title("s011akamj03006", shelf) == "月刊メガストア2026年9月号"
+        assert ex.bookshelf_title("missing", shelf) is None
+        assert ex.bookshelf_title("k077bscsh09791", Path(temporary) / "no.sqlite3") is None
+        assert ex.publication_title(Path("k077bscsh09791.dmmr"), shelf) == (
+            "記憶の鍵盤（新潮文庫nex）"
+        )
+        assert ex.publication_title(Path("missing.dmmb"), shelf) == "missing"
         ex.validate_navigation_coverage(307, [0, *range(307)], 306)
 
         parsed = ex.parse_args([str(Path("book.dmmb"))])
@@ -271,9 +310,10 @@ def main() -> None:
                 captured(root / "fixed-page-two.png", page_two, 23, 3),
             ],
             Path(temporary) / "fixed-epub" / "book.epub",
-            Path("book.dmme"),
+            Path("b355iakta25451.dmme"),
             page_count=3,
             initial_page=2,
+            title="サンプル作品",
         )
         with zipfile.ZipFile(fixed_output) as archive:
             assert archive.namelist()[0] == "mimetype"
@@ -290,6 +330,8 @@ def main() -> None:
             assert "rendition:layout" in archive.read("OEBPS/content.opf").decode()
             assert archive.read("OEBPS/image/page-0001.png") == red
             assert archive.read("OEBPS/image/page-0002.jpg") == blue
+            assert "<dc:title>サンプル作品</dc:title>" in archive.read("OEBPS/content.opf").decode()
+            assert "b355iakta25451" not in archive.read("OEBPS/nav.xhtml").decode()
 
         dmmb_epub = ex.export_fixed_epub(
             [
@@ -300,6 +342,7 @@ def main() -> None:
             Path("s011akamj03006.dmmb"),
             page_count=2,
             initial_page=0,
+            title="月刊メガストア2026年9月号",
         )
         with zipfile.ZipFile(dmmb_epub) as archive:
             assert archive.namelist()[0] == "mimetype"
@@ -308,6 +351,8 @@ def main() -> None:
             assert archive.read("OEBPS/image/page-0001.png") == red
             assert archive.read("OEBPS/image/page-0002.jpg") == blue
             assert "rendition:layout" in archive.read("OEBPS/content.opf").decode()
+            assert "<dc:title>月刊メガストア2026年9月号</dc:title>" in archive.read("OEBPS/content.opf").decode()
+            assert "s011akamj03006" not in archive.read("OEBPS/nav.xhtml").decode()
 
     print("all checks passed")
 
