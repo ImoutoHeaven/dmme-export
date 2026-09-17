@@ -272,6 +272,8 @@ def main() -> None:
         assert "last-position.reset" in ex.JS
         assert "return installURLRead('load_job.ReadRawData', target);" in ex.JS
         assert "installZipBookDump" in ex.JS
+        assert "ocf-chunk" in ex.JS
+        assert "MAX_OCF" in ex.JS
         assert "qt.QQuickText.setText" not in ex.JS
         assert "book-title" not in ex.JS
 

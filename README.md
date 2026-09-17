@@ -11,22 +11,21 @@ book type.
   JPEG remains `.jpg`, PNG remains `.png`, and other supported formats keep
   their format. `--dmmb-output epub` packs those pages as a fixed-layout
   `<book-name>.epub`.
-- `.dmme` produces a fixed-layout `<book-name>.epub` built from the captured
-  page images.
-- `.dmmr` produces `<book-name>.epub` from the viewer's in-memory OCF ZIP
-  (`zip_book`): original `mimetype`, `META-INF/container.xml`,
+- `.dmme` and `.dmmr` produce `<book-name>.epub` from the viewer's in-memory
+  OCF ZIP (`zip_book`): original `mimetype`, `META-INF/container.xml`,
   `item/standard.opf`, and publication resources. The dump is a stream of ZIP
   local file headers; the exporter appends a central directory so the file is a
   standard EPUB ZIP.
 
-For `.dmmb --dmmb-output epub` and `.dmme`, EPUB `dc:title` is
-`my_library.title` for `product_Id` (the filename stem) in
+For `.dmmb --dmmb-output epub`, EPUB `dc:title` is `my_library.title` for
+`product_Id` (the filename stem) in
 `%APPDATA%\DMM\DMMbookviewer2\dmmbookshelf.sqlite3`, or the filename stem.
-A `.dmmr` EPUB keeps the dumped package metadata (`dc:title`, spine, manifest).
+A `.dmme` or `.dmmr` EPUB keeps the dumped package metadata (`dc:title`, spine,
+manifest).
 
-Captured `.dmmb`/`.dmme` image payloads are copied byte-for-byte. Pillow inspects
-image format and dimensions. Generated fixed-layout EPUB image entries may use
-ZIP DEFLATE as lossless container compression.
+Captured `.dmmb` image payloads are copied byte-for-byte. Pillow inspects image
+format and dimensions. Generated fixed-layout EPUB image entries may use ZIP
+DEFLATE as lossless container compression.
 
 ## Requirements
 
@@ -77,31 +76,27 @@ Use `--viewer PATH` for an unregistered installation.
 The exporter attaches before the viewer resumes.
 
 On the pinned viewer build, a pre-navigation hook sets the returned in-memory
-saved position to spine item `0` with an empty CFI. Default `.dmmb`/`.dmme`
-capture then requests logical page `0` and traverses forward through
-`pageCount - 1`. That capture path installs the position-reset hook first.
+saved position to spine item `0` with an empty CFI. Default `.dmmb` capture then
+requests logical page `0` and traverses forward through `pageCount - 1`. That
+capture path installs the position-reset hook first.
 
 For `.dmmb`, navigation coverage and the number of page-sized image resources
 must match the viewer's logical page count. Identical image bytes on different
-logical pages are retained.
+logical pages are retained. The book is a capsule of per-page `.dmmj` images;
+the viewer decrypts a page when it paints it.
 
-For `.dmme`, the viewer's fixed-layout page count is checked against the page
-images. Images observed before a restored nonzero starting position are dropped.
-Each remaining page becomes one fixed-layout XHTML wrapper. Page order is the
-capture sequence.
-
-For `.dmmr`, capture finishes when the `zip_book` dump arrives. The pinned
-build dumps the decrypted OCF at RVA `0x1349E0` with `zseek(0)` and `zread`
-of the unzip size at `this+0x60+0xa8`. The rebuilt EPUB uses the publication
-OPF spine (`item/standard.opf`).
+For `.dmme` and `.dmmr`, capture finishes when the `zip_book` dump arrives. The
+pinned build dumps the decrypted OCF at RVA `0x1349E0` with `zseek(0)` and
+chunked `zread` of the unzip size at `this+0x60+0xa8`. The rebuilt EPUB uses
+the publication OPF spine (`item/standard.opf`).
 
 ## EPUB compatibility
 
-A `.dmmr` EPUB is the dumped OCF plus a ZIP central directory. It keeps the
-package `full-path` from `META-INF/container.xml` (typically
+A `.dmme` or `.dmmr` EPUB is the dumped OCF plus a ZIP central directory. It
+keeps the package `full-path` from `META-INF/container.xml` (typically
 `item/standard.opf`).
 
-A `.dmme` or `.dmmb --dmmb-output epub` file is a generated container:
+A `.dmmb --dmmb-output epub` file is a generated container:
 
 - `mimetype` as the first, uncompressed ZIP entry
 - `META-INF/container.xml`
@@ -125,11 +120,11 @@ On that build the exporter uses these RVAs:
 |------|-----|
 | `load_job.ReadRawData` | `0x8B340` |
 | saved-position loader | `0x40070` |
-| `zip_book` OCF dump (`.dmmr`) | `0x1349E0` |
+| `zip_book` OCF dump (`.dmme`/`.dmmr`) | `0x1349E0` |
 
 For a different SHA-256, executable ranges of `DMMbookviewer.exe` are scanned
-for `load_job.ReadRawData` and the saved-position loader. `.dmmr` OCF dump
-uses the pinned `zip_book` RVA, so it runs on the pinned SHA-256.
+for `load_job.ReadRawData` and the saved-position loader. `.dmme`/`.dmmr` OCF
+dump uses the pinned `zip_book` RVA, so it runs on the pinned SHA-256.
 
 `load_job.ReadRawData` signature (the relative displacement after `E9` is
 omitted). Exactly one match must resolve to executable code in
@@ -159,8 +154,8 @@ FF FF FF FF 48 C7 41 28 0F 00 00 00 48 89 69 20 40
 --timeout-seconds N    Abort capture after N seconds (240).
 --navigation-wait-ms N Extra delay after each page change (0).
 --keep-resources       Keep OUT\_resources after a successful export.
---no-traverse          Skip page navigation (diagnostic for .dmmb/.dmme;
-                       .dmmr still dumps zip_book).
+--no-traverse          Skip page navigation (diagnostic for .dmmb;
+                       .dmme/.dmmr still dump zip_book).
 --dmmb-output images|epub
                        For .dmmb: write page images (default) or a fixed-layout EPUB.
 ```

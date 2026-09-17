@@ -73,6 +73,8 @@ JS = r"""
 'use strict';
 
 const MAX_CHUNK = 64 * 1024 * 1024;
+const MAX_OCF = 256 * 1024 * 1024;
+const OCF_CHUNK = 4 * 1024 * 1024;
 let callSequence = 0;
 let navigationPage = -1;
 const installedReads = new Set();
@@ -757,7 +759,10 @@ function installZipBookDump() {
         try {
           const unzip = this.self.add(0x60).readPointer();
           const size = unzip.add(0xa8).readU64().toNumber();
-          if (size < 64 || size > MAX_CHUNK) return;
+          if (size < 64 || size > MAX_OCF) {
+            send({type: 'ocf-skip', size: size});
+            return;
+          }
           const cursor = Memory.alloc(16);
           const tell = new NativeFunction(
             this.self.readPointer().add(0x10).readPointer(),
@@ -765,13 +770,18 @@ function installZipBookDump() {
           tell(this.self, cursor);
           const pos = cursor.add(8).readU64();
           zseek(this.self, this.self, ptr(0), 0);
-          const buf = Memory.alloc(size);
-          const n = zread(this.self, this.self, buf, size);
-          zseek(this.self, this.self, ptr(pos.toString()), 0);
-          if (n > 0) {
-            dumped = true;
-            send({type: 'ocf-zip', size: n}, buf.readByteArray(n));
+          let got = 0;
+          while (got < size) {
+            const n = Math.min(OCF_CHUNK, size - got);
+            const buf = Memory.alloc(n);
+            const r = zread(this.self, this.self, buf, n);
+            if (r <= 0) break;
+            send({type: 'ocf-chunk', off: got, n: r, size: size}, buf.readByteArray(r));
+            got += r;
           }
+          zseek(this.self, this.self, ptr(pos.toString()), 0);
+          dumped = true;
+          send({type: 'ocf-done', size: got});
         } catch (e) {
           send({type: 'hook-error', name: 'zip_book.dump', error: String(e)});
         }
@@ -824,6 +834,7 @@ class NavigationState:
     last_position_hooked: bool | None = None
     jumps: list[int] = field(default_factory=list)
     ocf_zip: bytes | None = None
+    ocf_chunks: dict[int, bytes] = field(default_factory=dict)
 
 
 class ResourceWriter:
@@ -1702,10 +1713,15 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
                 print(payload, flush=True)
             return
         kind = payload.get("type")
-        if kind == "ocf-zip":
+        if kind == "ocf-chunk":
             if data:
-                navigation.ocf_zip = bytes(data)
-                print(f"[ocf-zip] {len(navigation.ocf_zip)} bytes", flush=True)
+                navigation.ocf_chunks[int(payload["off"])] = bytes(data)
+                print(f"[ocf-chunk] off={payload.get('off')} n={payload.get('n')}", flush=True)
+        elif kind == "ocf-done":
+            navigation.ocf_zip = b"".join(
+                navigation.ocf_chunks[off] for off in sorted(navigation.ocf_chunks)
+            )
+            print(f"[ocf-zip] {len(navigation.ocf_zip)} bytes", flush=True)
         elif kind == "resource-chunk":
             if data is not None:
                 writer.submit(payload, data)
@@ -1744,7 +1760,8 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
             "hooks-ready", "qt-hooks-ready", "navigation-ready", "navigation-missing",
             "navigation-error", "navigation-canvas", "navigation-retry",
             "last-position-resolved", "last-position-reset",
-            "url-metadata-ready", "url-request", "url-job", "ocf-zip",
+            "url-metadata-ready", "url-request", "url-job",
+            "ocf-zip", "ocf-done", "ocf-skip",
         }:
             if kind in {"hook-installed", "hook-missing", "hook-error"}:
                 name = payload.get("name")
@@ -1903,7 +1920,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"[pid] {pid}", flush=True)
         wait_for_resources(writer, args.settle_seconds, args.timeout_seconds,
-                           navigation, stop_on_ocf=suffix == ".dmmr")
+                           navigation, stop_on_ocf=suffix in {".dmmr", ".dmme"})
     except Exception as exc:
         print(f"[fail] {exc}", file=sys.stderr)
         return 1
@@ -1922,7 +1939,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         resources = writer.resources()
-        if suffix == ".dmmr":
+        if suffix in {".dmmr", ".dmme"}:
             if not navigation.ocf_zip:
                 raise RuntimeError("zip_book dump was empty; keep resources for diagnosis")
             output = out_dir / f"{book.stem}.epub"
