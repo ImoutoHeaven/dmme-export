@@ -274,6 +274,9 @@ def main() -> None:
         assert "installZipBookDump" in ex.JS
         assert "ocf-chunk" in ex.JS
         assert "MAX_OCF" in ex.JS
+        assert "dmmb.page.flush" in ex.JS
+        assert "spreadComplete" in ex.JS
+        assert "Date.now() - navigationLastResourceAt >= 200" in ex.JS
         assert "qt.QQuickText.setText" not in ex.JS
         assert "book-title" not in ex.JS
 

@@ -31,6 +31,8 @@ VIEWER_SHA256 = "edfac9ac051fdb6726dcc77168d661f546c062e64b3e05af405f2b2bf71cfd5
 LOAD_JOB_READ_RAW_RVA = 0x8B340
 LAST_POSITION_RVA = 0x40070
 ZIP_BOOK_RVA = 0x1349E0
+PAGE_FILL_RVA = 0x21B80
+PAGE_FLUSH_RVA = 0x20ED0
 # The last-position loader has no link-dependent branch in this build.
 LAST_POSITION_SIGNATURE = (
     "48 8B C4 48 89 48 08 56 57 41 56 48 83 EC 60 "
@@ -45,6 +47,7 @@ EPUB_SUFFIXES = {".dmme", ".dmmr"}
 SUPPORTED_SUFFIXES = EPUB_SUFFIXES | {".dmmb"}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PAGE_RESOURCE_SOURCE = "qt.QPixmap.loadFromData"
+PAGE_FLUSH_SOURCE = "dmmb.page.flush"
 MIN_PAGE_AREA = 500_000
 IMAGE_EXTENSIONS = {
     "jpeg": "jpg",
@@ -75,8 +78,10 @@ JS = r"""
 const MAX_CHUNK = 64 * 1024 * 1024;
 const MAX_OCF = 256 * 1024 * 1024;
 const OCF_CHUNK = 4 * 1024 * 1024;
+const captureMode = '__MODE__';
+const dmmbPages = captureMode === 'dmmb';
 let callSequence = 0;
-let navigationPage = -1;
+let navigationPage = 0;
 const installedReads = new Set();
 const installedBoundaries = new Set();
 const main = Process.mainModule;
@@ -489,10 +494,12 @@ function installQtHooks() {
   const byteArrayData = byteArrayDataAddress
     ? new NativeFunction(byteArrayDataAddress, 'pointer', ['pointer'])
     : null;
-  installByteArray('qt.QPixmap.loadFromData', findModuleExport(
-    'Qt5Gui.dll',
-    '?loadFromData@QPixmap@@QEAA_NAEBVQByteArray@@PEBDV?$QFlags@W4ImageConversionFlag@Qt@@@@@Z'
-  ), byteArraySize, byteArrayData);
+  if (!dmmbPages) {
+    installByteArray('qt.QPixmap.loadFromData', findModuleExport(
+      'Qt5Gui.dll',
+      '?loadFromData@QPixmap@@QEAA_NAEBVQByteArray@@PEBDV?$QFlags@W4ImageConversionFlag@Qt@@@@@Z'
+    ), byteArraySize, byteArrayData);
+  }
   send({type: 'qt-hooks-ready'});
   return true;
 }
@@ -622,6 +629,31 @@ function navigationMakeOrder(count) {
   for (let i = 0; i < count; i++) result.push(i);
   return result;
 }
+function spreadComplete() {
+  return spreadArmed && spreadFill > 0 && spreadFlush >= spreadFill;
+}
+function resetSpread() {
+  spreadFill = 0;
+  spreadFlush = 0;
+  spreadArmed = false;
+  for (const key in spreadEmitted) delete spreadEmitted[key];
+}
+function finishIfCaptured(count) {
+  if (assignedPage >= count) {
+    navigationDone = true;
+    send({type: 'navigation-done', pageCount: count, assigned: assignedPage});
+    return true;
+  }
+  return false;
+}
+function turnTo(page, current, count) {
+  resetSpread();
+  const queued = navigationInvoke(page);
+  navigationPendingPage = page;
+  navigationSentAt = Date.now();
+  send({type: 'navigation-turn', page: page, current: current, queued: queued,
+        assigned: assignedPage, count: count});
+}
 function navigationTick() {
   try {
     if (!navigationEnabled || navigationDone) return;
@@ -643,14 +675,36 @@ function navigationTick() {
     }
     const count = navigationReadProperty(navigationPageCountIndex);
     if (count <= 0) return;
+    const current = navigationReadProperty(navigationCurrentPageIndex);
+    if (dmmbPages) {
+      if (!navigationOrderPages) {
+        navigationOrderPages = [];
+        send({type: 'navigation-properties', pageCount: count,
+              currentPage: current, order: navigationOrder, count: count});
+      }
+      if (navigationPendingPage === null) {
+        if (!spreadComplete()) return;
+        if (finishIfCaptured(count)) return;
+        turnTo(assignedPage, current, count);
+        return;
+      }
+      if (current === navigationPendingPage && spreadComplete()) {
+        if (finishIfCaptured(count)) return;
+        turnTo(assignedPage, current, count);
+      } else if (current !== navigationPendingPage && Date.now() - navigationSentAt > 8000) {
+        const queued = navigationInvoke(navigationPendingPage);
+        navigationSentAt = Date.now();
+        send({type: 'navigation-retry', page: navigationPendingPage,
+              current: current, queued: queued});
+      }
+      return;
+    }
     if (!navigationOrderPages) {
       navigationOrderPages = navigationMakeOrder(count);
       navigationNextPage = navigationOrderPages.shift();
       send({type: 'navigation-properties', pageCount: count,
-            currentPage: navigationReadProperty(navigationCurrentPageIndex),
-            order: navigationOrder, count: count});
+            currentPage: current, order: navigationOrder, count: count});
     }
-    const current = navigationReadProperty(navigationCurrentPageIndex);
     if (navigationPendingPage !== null) {
       if (current === navigationPendingPage) {
         if (!navigationReadyAt) navigationReadyAt = Date.now();
@@ -701,6 +755,11 @@ let navigationPendingPage = null;
 let navigationSentAt = 0;
 let navigationReadyAt = 0;
 let navigationLastResourceAt = 0;
+let spreadFill = 0;
+let spreadFlush = 0;
+let spreadArmed = false;
+let assignedPage = 0;
+const spreadEmitted = {};
 let navTopLevelWidgets = null;
 let navRootObject = null;
 let navChildren = null;
@@ -721,7 +780,7 @@ for (let i = 0; i < 9; i++) {
   empty.add(8).writePointer(ptr(0));
   navigationEmptyArguments.push(empty);
 }
-if (navigationEnabled) setInterval(navigationTick, 200);
+if (navigationEnabled) setInterval(navigationTick, dmmbPages ? 20 : 200);
 
 send({
   type: 'capture-ready',
@@ -795,8 +854,72 @@ function installZipBookDump() {
   }
 }
 
+function installPageFlush() {
+  if (!dmmbPages) return false;
+  const fillRva = __PAGE_FILL_RVA__;
+  const flushRva = __PAGE_FLUSH_RVA__;
+  if (fillRva === null || flushRva === null) {
+    send({type: 'hook-missing', name: 'dmmb.page.flush'});
+    return false;
+  }
+  try {
+    Interceptor.attach(main.base.add(fillRva), {
+      onEnter() { spreadArmed = true; }
+    });
+    Interceptor.attach(main.base.add(flushRva), {
+      onEnter(args) { this.self = args[0]; },
+      onLeave() {
+        try {
+          const size = this.self.add(0x98).readU32();
+          const bytes = this.self.add(0xa0).readPointer();
+          if (bytes.isNull() || size < 128 || size > MAX_CHUNK) return;
+          const head = new Uint8Array(bytes.readByteArray(Math.min(16, size)));
+          const jpeg = head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff;
+          const png = head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47;
+          if (!jpeg && !png) return;
+          const owner = this.self.toString();
+          if (spreadEmitted[owner]) return;
+          spreadEmitted[owner] = 1;
+          spreadArmed = true;
+          spreadFill += 1;
+          spreadFlush += 1;
+          const page = assignedPage;
+          assignedPage += 1;
+          const sequence = callSequence++;
+          send({type: 'navigation-jump', page: page, current: page, queued: 1});
+          send({
+            type: 'resource-chunk',
+            source: 'dmmb.page.flush',
+            owner: this.self.toString() + ':' + page,
+            sequence: sequence,
+            page: page,
+            requested: size,
+            size: size
+          }, bytes.readByteArray(size));
+          send({
+            type: 'resource-eof',
+            source: 'dmmb.page.flush',
+            owner: this.self.toString() + ':' + page,
+            sequence: sequence,
+            page: page
+          });
+        } catch (e) {
+          send({type: 'hook-error', name: 'dmmb.page.flush', error: String(e)});
+        }
+      }
+    });
+    send({type: 'hook-installed', name: 'dmmb.page.flush',
+          address: main.base.add(flushRva).toString()});
+    return true;
+  } catch (e) {
+    send({type: 'hook-error', name: 'dmmb.page.flush', error: String(e)});
+    return false;
+  }
+}
+
 send({type: 'hooks-ready'});
 installZipBookDump();
+installPageFlush();
 """
 
 
@@ -1058,7 +1181,9 @@ def _page_resources(resources: list[CapturedResource]) -> list[CapturedResource]
         if size is not None:
             images.append((resource, size))
 
-    preferred = [item for item in images if item[0].source == PAGE_RESOURCE_SOURCE]
+    preferred = [item for item in images if item[0].source == PAGE_FLUSH_SOURCE]
+    if not preferred:
+        preferred = [item for item in images if item[0].source == PAGE_RESOURCE_SOURCE]
     pool = preferred or images
     if not pool:
         return []
@@ -1098,7 +1223,7 @@ def export_images(resources: list[CapturedResource], out_dir: Path,
         resources = [resource for resource in resources if resource.page >= 0]
 
     pages: list[Path] = []
-    seen: set[tuple[int, str]] = set()
+    seen_pages: set[int] = set()
     startup_page = initial_page if initial_page is not None else -1
     for resource in _page_resources(resources):
         page = resource.page
@@ -1108,8 +1233,7 @@ def export_images(resources: list[CapturedResource], out_dir: Path,
             page = startup_page
             if startup_page >= 0:
                 startup_page += 1
-        key = (page, resource.sha256)
-        if key in seen:
+        if page in seen_pages:
             continue
         kind = resource_kind(resource.path)
         if kind is None:
@@ -1118,7 +1242,7 @@ def export_images(resources: list[CapturedResource], out_dir: Path,
             f"page_{len(pages) + 1:03d}.{IMAGE_EXTENSIONS[kind]}"
         )
         if _copy_image(resource, destination):
-            seen.add(key)
+            seen_pages.add(page)
             pages.append(destination)
         else:
             destination.unlink(missing_ok=True)
@@ -1509,6 +1633,15 @@ def export_fixed_epub(resources: list[CapturedResource], destination: Path,
     ]
     if initial_page is not None and initial_page != 0:
         candidates = [resource for resource in candidates if resource.page >= 0]
+    unique: list[CapturedResource] = []
+    seen_pages: set[int] = set()
+    for resource in candidates:
+        if resource.page in seen_pages:
+            continue
+        unique.append(resource)
+        if resource.page >= 0:
+            seen_pages.add(resource.page)
+    candidates = unique
     if page_count is not None and page_count > 0:
         if len(candidates) == page_count + 1:
             # The restored page is painted before the first controlled jump.
@@ -1759,6 +1892,7 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
             "hook-installed", "hook-missing", "hook-error", "capture-ready",
             "hooks-ready", "qt-hooks-ready", "navigation-ready", "navigation-missing",
             "navigation-error", "navigation-canvas", "navigation-retry",
+            "navigation-turn",
             "last-position-resolved", "last-position-reset",
             "url-metadata-ready", "url-request", "url-job",
             "ocf-zip", "ocf-done", "ocf-skip",
@@ -1780,6 +1914,8 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
         .replace("__TRAVERSE__", "true" if traverse else "false")
         .replace("__NAV_WAIT_MS__", str(wait_ms))
         .replace("__ZIP_BOOK_RVA__", "null" if load_job_rva is None else hex(ZIP_BOOK_RVA))
+        .replace("__PAGE_FILL_RVA__", "null" if load_job_rva is None else hex(PAGE_FILL_RVA))
+        .replace("__PAGE_FLUSH_RVA__", "null" if load_job_rva is None else hex(PAGE_FLUSH_RVA))
     )
     script = session.create_script(source)
     script.on("message", on_message)
@@ -1919,8 +2055,13 @@ def main(argv: list[str] | None = None) -> int:
             args.navigation_wait_ms, load_job_rva,
         )
         print(f"[pid] {pid}", flush=True)
-        wait_for_resources(writer, args.settle_seconds, args.timeout_seconds,
-                           navigation, stop_on_ocf=suffix in {".dmmr", ".dmme"})
+        wait_for_resources(
+            writer,
+            0 if suffix == ".dmmb" else args.settle_seconds,
+            args.timeout_seconds,
+            navigation,
+            stop_on_ocf=suffix in {".dmmr", ".dmme"},
+        )
     except Exception as exc:
         print(f"[fail] {exc}", file=sys.stderr)
         return 1

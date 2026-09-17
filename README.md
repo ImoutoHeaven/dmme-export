@@ -76,14 +76,17 @@ Use `--viewer PATH` for an unregistered installation.
 The exporter attaches before the viewer resumes.
 
 On the pinned viewer build, a pre-navigation hook sets the returned in-memory
-saved position to spine item `0` with an empty CFI. Default `.dmmb` capture then
-requests logical page `0` and traverses forward through `pageCount - 1`. That
-capture path installs the position-reset hook first.
+saved position to spine item `0` with an empty CFI. Default `.dmmb` capture
+collects the opening spread from flush, then `pageJump`s from `1` through
+`pageCount - 1`. That capture path installs the position-reset hook first.
 
-For `.dmmb`, navigation coverage and the number of page-sized image resources
-must match the viewer's logical page count. Identical image bytes on different
-logical pages are retained. The book is a capsule of per-page `.dmmj` images;
-the viewer decrypts a page when it paints it.
+For `.dmmb`, the viewer decrypts the current spread into page objects. Capture
+hooks `FUN_140021b80` (fill) and `FUN_140020ed0` (flush) at RVAs `0x21B80` and
+`0x20ED0`. A flush copies the plaintext JPEG or PNG at `this+0xa0`. The next
+`pageJump` runs only after that spread's flushes match its fills. Page numbers
+are assigned at flush, in capture order. Navigation coverage and the number of
+page-sized image resources must match the viewer's logical page count. Identical
+image bytes on different logical pages are retained.
 
 For `.dmme` and `.dmmr`, capture finishes when the `zip_book` dump arrives. The
 pinned build dumps the decrypted OCF at RVA `0x1349E0` with `zseek(0)` and
@@ -121,6 +124,8 @@ On that build the exporter uses these RVAs:
 | `load_job.ReadRawData` | `0x8B340` |
 | saved-position loader | `0x40070` |
 | `zip_book` OCF dump (`.dmme`/`.dmmr`) | `0x1349E0` |
+| `.dmmb` page fill | `0x21B80` |
+| `.dmmb` page flush | `0x20ED0` |
 
 For a different SHA-256, executable ranges of `DMMbookviewer.exe` are scanned
 for `load_job.ReadRawData` and the saved-position loader. `.dmme`/`.dmmr` OCF
@@ -152,7 +157,7 @@ FF FF FF FF 48 C7 41 28 0F 00 00 00 48 89 69 20 40
 --viewer PATH          Use a specific DMMbookviewer.exe.
 --settle-seconds N     Wait for final resource activity to settle (5).
 --timeout-seconds N    Abort capture after N seconds (240).
---navigation-wait-ms N Extra delay after each page change (0).
+--navigation-wait-ms N Extra delay after each page change (0). Unused for `.dmmb`.
 --keep-resources       Keep OUT\_resources after a successful export.
 --no-traverse          Skip page navigation (diagnostic for .dmmb;
                        .dmme/.dmmr still dump zip_book).
