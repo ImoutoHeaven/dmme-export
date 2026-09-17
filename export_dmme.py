@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import io
 import os
 import posixpath
 import queue
 import shlex
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,6 +30,7 @@ from PIL import Image
 VIEWER_SHA256 = "edfac9ac051fdb6726dcc77168d661f546c062e64b3e05af405f2b2bf71cfd5f"
 LOAD_JOB_READ_RAW_RVA = 0x8B340
 LAST_POSITION_RVA = 0x40070
+ZIP_BOOK_RVA = 0x1349E0
 # The last-position loader has no link-dependent branch in this build.
 LAST_POSITION_SIGNATURE = (
     "48 8B C4 48 89 48 08 56 57 41 56 48 83 EC 60 "
@@ -737,7 +740,53 @@ if (!netReady || !qtReady) {
     if (netReady && qtReady) clearInterval(timer);
   }, 100);
 }
+function installZipBookDump() {
+  const rva = __ZIP_BOOK_RVA__;
+  if (rva === null) return false;
+  const zread = new NativeFunction(main.base.add(0x6cea0), 'uint',
+    ['pointer', 'pointer', 'pointer', 'uint']);
+  const zseek = new NativeFunction(main.base.add(0x6d080), 'int',
+    ['pointer', 'pointer', 'pointer', 'int']);
+  const target = main.base.add(rva);
+  let dumped = false;
+  try {
+    Interceptor.attach(target, {
+      onEnter(args) { this.self = args[0]; },
+      onLeave() {
+        if (dumped) return;
+        try {
+          const unzip = this.self.add(0x60).readPointer();
+          const size = unzip.add(0xa8).readU64().toNumber();
+          if (size < 64 || size > MAX_CHUNK) return;
+          const cursor = Memory.alloc(16);
+          const tell = new NativeFunction(
+            this.self.readPointer().add(0x10).readPointer(),
+            'pointer', ['pointer', 'pointer']);
+          tell(this.self, cursor);
+          const pos = cursor.add(8).readU64();
+          zseek(this.self, this.self, ptr(0), 0);
+          const buf = Memory.alloc(size);
+          const n = zread(this.self, this.self, buf, size);
+          zseek(this.self, this.self, ptr(pos.toString()), 0);
+          if (n > 0) {
+            dumped = true;
+            send({type: 'ocf-zip', size: n}, buf.readByteArray(n));
+          }
+        } catch (e) {
+          send({type: 'hook-error', name: 'zip_book.dump', error: String(e)});
+        }
+      }
+    });
+    send({type: 'hook-installed', name: 'zip_book.dump', address: target.toString()});
+    return true;
+  } catch (e) {
+    send({type: 'hook-error', name: 'zip_book.dump', error: String(e)});
+    return false;
+  }
+}
+
 send({type: 'hooks-ready'});
+installZipBookDump();
 """
 
 
@@ -774,6 +823,7 @@ class NavigationState:
     load_job_hooked: bool | None = None
     last_position_hooked: bool | None = None
     jumps: list[int] = field(default_factory=list)
+    ocf_zip: bytes | None = None
 
 
 class ResourceWriter:
@@ -1154,14 +1204,18 @@ def bookshelf_title(product_id: str, db_path: Path | None = None) -> str | None:
         db_path = Path(appdata) / "DMM" / "DMMbookviewer2" / "dmmbookshelf.sqlite3"
     if not db_path.is_file():
         return None
+    connection = None
     try:
-        with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True) as connection:
-            row = connection.execute(
-                "SELECT title FROM my_library WHERE product_Id = ? LIMIT 1",
-                (product_id,),
-            ).fetchone()
+        connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        row = connection.execute(
+            "SELECT title FROM my_library WHERE product_Id = ? LIMIT 1",
+            (product_id,),
+        ).fetchone()
     except sqlite3.Error:
         return None
+    finally:
+        if connection is not None:
+            connection.close()
     if not row or not isinstance(row[0], str):
         return None
     title = " ".join(row[0].split())
@@ -1235,6 +1289,54 @@ def _zip_directories(names: list[str]) -> list[str]:
             directories.add(parent + "/")
             parent = posixpath.dirname(parent)
     return sorted(directories)
+
+
+def rebuild_ocf_epub(local_headers: bytes) -> bytes:
+    """Turn a local-file-header stream into a ZIP with a central directory."""
+    if not local_headers.startswith(b"PK\x03\x04"):
+        raise RuntimeError("ocf dump is not a ZIP local-file-header stream")
+    offset = 0
+    records: list[tuple[bytes, int]] = []
+    while offset + 30 <= len(local_headers) and local_headers[offset:offset + 4] == b"PK\x03\x04":
+        start = offset
+        compressed = struct.unpack_from("<I", local_headers, offset + 18)[0]
+        name_len, extra_len = struct.unpack_from("<HH", local_headers, offset + 26)
+        header_end = offset + 30 + name_len + extra_len
+        if header_end + compressed > len(local_headers):
+            raise RuntimeError("ocf dump is truncated")
+        records.append((local_headers[start:header_end], start))
+        offset = header_end + compressed
+    if not records:
+        raise RuntimeError("ocf dump has no ZIP entries")
+    if offset != len(local_headers):
+        raise RuntimeError("ocf dump has trailing bytes after local headers")
+    central = bytearray()
+    for header, local_offset in records:
+        _ver, flags, method, time, date = struct.unpack_from("<HHHHH", header, 4)
+        crc, compressed, uncompressed = struct.unpack_from("<III", header, 14)
+        name_len, extra_len = struct.unpack_from("<HH", header, 26)
+        name = header[30:30 + name_len]
+        extra = header[30 + name_len:30 + name_len + extra_len]
+        central.extend(b"PK\x01\x02")
+        central.extend(struct.pack(
+            "<HHHHHHIIIHHHHHII",
+            0x14, 0x14, flags, method, time, date, crc, compressed, uncompressed,
+            name_len, extra_len, 0, 0, 0, 0, local_offset,
+        ))
+        central.extend(name)
+        central.extend(extra)
+    end = bytearray(b"PK\x05\x06")
+    end.extend(struct.pack(
+        "<HHHHIIH",
+        0, 0, len(records), len(records), len(central), offset, 0,
+    ))
+    archive = local_headers + bytes(central) + bytes(end)
+    with zipfile.ZipFile(io.BytesIO(archive)) as parsed:
+        if parsed.testzip() is not None:
+            raise RuntimeError("rebuilt OCF EPUB failed zip integrity")
+        if parsed.namelist()[0] != "mimetype" and "mimetype" not in parsed.namelist():
+            raise RuntimeError("rebuilt OCF EPUB is missing mimetype")
+    return archive
 
 
 def export_epub(resources: list[CapturedResource], destination: Path,
@@ -1600,7 +1702,11 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
                 print(payload, flush=True)
             return
         kind = payload.get("type")
-        if kind == "resource-chunk":
+        if kind == "ocf-zip":
+            if data:
+                navigation.ocf_zip = bytes(data)
+                print(f"[ocf-zip] {len(navigation.ocf_zip)} bytes", flush=True)
+        elif kind == "resource-chunk":
             if data is not None:
                 writer.submit(payload, data)
         elif kind in {"resource-open", "resource-close", "resource-eof"}:
@@ -1638,7 +1744,7 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
             "hooks-ready", "qt-hooks-ready", "navigation-ready", "navigation-missing",
             "navigation-error", "navigation-canvas", "navigation-retry",
             "last-position-resolved", "last-position-reset",
-            "url-metadata-ready", "url-request", "url-job",
+            "url-metadata-ready", "url-request", "url-job", "ocf-zip",
         }:
             if kind in {"hook-installed", "hook-missing", "hook-error"}:
                 name = payload.get("name")
@@ -1656,6 +1762,7 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
         .replace("__LAST_POSITION_SIGNATURE__", LAST_POSITION_SIGNATURE)
         .replace("__TRAVERSE__", "true" if traverse else "false")
         .replace("__NAV_WAIT_MS__", str(wait_ms))
+        .replace("__ZIP_BOOK_RVA__", "null" if load_job_rva is None else hex(ZIP_BOOK_RVA))
     )
     script = session.create_script(source)
     script.on("message", on_message)
@@ -1698,7 +1805,8 @@ def start_capture(device: Any, viewer: Path, book: Path,
 
 
 def wait_for_resources(writer: ResourceWriter, settle_seconds: float,
-                       timeout_seconds: float, navigation: NavigationState) -> None:
+                       timeout_seconds: float, navigation: NavigationState,
+                       stop_on_ocf: bool = False) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if navigation.load_job_matches is not None and navigation.load_job_matches != 1:
@@ -1710,6 +1818,8 @@ def wait_for_resources(writer: ResourceWriter, settle_seconds: float,
             raise RuntimeError("load_job.ReadRawData hook was not installed")
         if navigation.last_position_hooked is False:
             raise RuntimeError("last-position reset hook was not installed")
+        if stop_on_ocf and navigation.ocf_zip:
+            return
 
         if navigation.done.is_set() and writer.chunks and \
                 time.monotonic() - writer.last_message >= settle_seconds:
@@ -1793,7 +1903,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"[pid] {pid}", flush=True)
         wait_for_resources(writer, args.settle_seconds, args.timeout_seconds,
-                           navigation)
+                           navigation, stop_on_ocf=suffix == ".dmmr")
     except Exception as exc:
         print(f"[fail] {exc}", file=sys.stderr)
         return 1
@@ -1812,7 +1922,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         resources = writer.resources()
-        if epub_mode:
+        if suffix == ".dmmr":
+            if not navigation.ocf_zip:
+                raise RuntimeError("zip_book dump was empty; keep resources for diagnosis")
+            output = out_dir / f"{book.stem}.epub"
+            output.write_bytes(rebuild_ocf_epub(navigation.ocf_zip))
+            print(f"[title] {publication_title(book)}", flush=True)
+        elif epub_mode:
             if traverse:
                 validate_navigation_coverage(
                     navigation.page_count,

@@ -1,9 +1,8 @@
 # dmme-export
 
-Capture content from a licensed DMMbookviewer session without keyboard or mouse
-input. The exporter attaches while the viewer is suspended, hooks decrypted
-resource reads, writes resource data asynchronously, and produces an output
-for the book type.
+Capture content from a licensed DMMbookviewer session. The exporter attaches
+while the viewer is suspended, installs hooks, and writes an output for the
+book type.
 
 ## Outputs
 
@@ -14,16 +13,20 @@ for the book type.
   `<book-name>.epub`.
 - `.dmme` produces a fixed-layout `<book-name>.epub` built from the captured
   page images.
-- `.dmmr` produces a reflowable `<book-name>.epub` built from captured XHTML,
-  CSS, image, font, and other book resources.
+- `.dmmr` produces `<book-name>.epub` from the viewer's in-memory OCF ZIP
+  (`zip_book`): original `mimetype`, `META-INF/container.xml`,
+  `item/standard.opf`, and publication resources. The dump is a stream of ZIP
+  local file headers; the exporter appends a central directory so the file is a
+  standard EPUB ZIP.
 
-EPUB `dc:title` is `my_library.title` for `product_Id` (the filename stem) in
+For `.dmmb --dmmb-output epub` and `.dmme`, EPUB `dc:title` is
+`my_library.title` for `product_Id` (the filename stem) in
 `%APPDATA%\DMM\DMMbookviewer2\dmmbookshelf.sqlite3`, or the filename stem.
+A `.dmmr` EPUB keeps the dumped package metadata (`dc:title`, spine, manifest).
 
-Captured image and document payloads are copied byte-for-byte. Pillow is used
-only to inspect image format and dimensions. It never saves or converts captured
-images. EPUB image entries may use ZIP DEFLATE, which is lossless container
-compression and does not re-encode the image.
+Captured `.dmmb`/`.dmme` image payloads are copied byte-for-byte. Pillow inspects
+image format and dimensions. Generated fixed-layout EPUB image entries may use
+ZIP DEFLATE as lossless container compression.
 
 ## Requirements
 
@@ -53,8 +56,7 @@ uv pip install --python .venv\Scripts\python.exe frida-tools pillow
 The output directory is optional. The default is `dump\<book-name>`.
 
 For `.dmmb --dmmb-output images` (default), pages are files in the output
-directory. For `.dmme`, `.dmmr`, and `.dmmb --dmmb-output epub`, the generated
-EPUB is:
+directory. For `.dmme`, `.dmmr`, and `.dmmb --dmmb-output epub`, the EPUB is:
 
 ```text
 output\<book-name>.epub
@@ -72,38 +74,34 @@ Use `--viewer PATH` for an unregistered installation.
 
 ## Capture
 
-All three formats may reopen at the viewer's saved position. On the pinned
-viewer build, a pre-navigation hook changes the returned saved position to
-spine item `0` with an empty CFI in memory; it does not modify the Reader's
-SQLite database. The default capture then attaches before resume, requests
-logical page `0`, and traverses forward through `pageCount - 1`. If the
-position-reset hook cannot be installed, default capture fails rather than
-silently using a restored position.
+The exporter attaches before the viewer resumes.
+
+On the pinned viewer build, a pre-navigation hook sets the returned in-memory
+saved position to spine item `0` with an empty CFI. Default `.dmmb`/`.dmme`
+capture then requests logical page `0` and traverses forward through
+`pageCount - 1`. That capture path installs the position-reset hook first.
 
 For `.dmmb`, navigation coverage and the number of page-sized image resources
 must match the viewer's logical page count. Identical image bytes on different
 logical pages are retained.
 
 For `.dmme`, the viewer's fixed-layout page count is checked against the page
-images. The exporter removes images observed before a restored nonzero starting
-position and creates one fixed-layout XHTML wrapper per page. A dual-page image
-callback is not used as the page-order source.
+images. Images observed before a restored nonzero starting position are dropped.
+Each remaining page becomes one fixed-layout XHTML wrapper. Page order is the
+capture sequence.
 
-For `.dmmr`, `pageCount` is the Reader's rendered pagination count, not the
-number of XHTML spine documents. The exporter validates the full logical-page
-traversal before packaging resources from the `cjh://.../item/...` protocol.
-Resource request order can differ from the source publication spine when the
-Reader preloads or restores a page, so the generated spine is an ordering of
-captured resources, not a recovery of the source OPF spine.
-
-The generated EPUB is a new container. It creates its own metadata, OPF,
-spine, navigation, and XHTML wrappers; it does not restore the publication's
-original OPF metadata or spine. Captured XHTML, CSS, images, fonts, and other
-payloads remain in their captured relative paths.
+For `.dmmr`, capture finishes when the `zip_book` dump arrives. The pinned
+build dumps the decrypted OCF at RVA `0x1349E0` with `zseek(0)` and `zread`
+of the unzip size at `this+0x60+0xa8`. The rebuilt EPUB uses the publication
+OPF spine (`item/standard.opf`).
 
 ## EPUB compatibility
 
-Generated EPUB files contain:
+A `.dmmr` EPUB is the dumped OCF plus a ZIP central directory. It keeps the
+package `full-path` from `META-INF/container.xml` (typically
+`item/standard.opf`).
+
+A `.dmme` or `.dmmb --dmmb-output epub` file is a generated container:
 
 - `mimetype` as the first, uncompressed ZIP entry
 - `META-INF/container.xml`
@@ -115,25 +113,35 @@ Generated EPUB files contain:
 
 ## Viewer compatibility
 
-The internal `load_job.ReadRawData` hook uses a pinned RVA when the viewer
-SHA-256 is:
+Pinned `DMMbookviewer.exe` SHA-256:
 
 ```text
 edfac9ac051fdb6726dcc77168d661f546c062e64b3e05af405f2b2bf71cfd5f
 ```
 
-For a different SHA-256, executable ranges are scanned for this signature:
+On that build the exporter uses these RVAs:
+
+| hook | RVA |
+|------|-----|
+| `load_job.ReadRawData` | `0x8B340` |
+| saved-position loader | `0x40070` |
+| `zip_book` OCF dump (`.dmmr`) | `0x1349E0` |
+
+For a different SHA-256, executable ranges of `DMMbookviewer.exe` are scanned
+for `load_job.ReadRawData` and the saved-position loader. `.dmmr` OCF dump
+uses the pinned `zip_book` RVA, so it runs on the pinned SHA-256.
+
+`load_job.ReadRawData` signature (the relative displacement after `E9` is
+omitted). Exactly one match must resolve to executable code in
+`DMMbookviewer.exe`:
 
 ```text
 45 89 01 48 8B 89 18 01 00 00 4D 8B C1 E9
 ```
 
-The relative displacement after `E9` is not part of the match. Exactly one
-match must resolve to executable code in `DMMbookviewer.exe`.
-
-The saved-position loader uses RVA `0x40070` on the pinned build. For a
-non-pinned build, executable ranges are scanned for this function-start
-signature:
+Saved-position loader function-start signature. Exactly one match is required
+before default `.dmmb`/`.dmme` traversal continues. The hook writes the
+returned in-memory `item_index` and CFI:
 
 ```text
 48 8B C4 48 89 48 08 56 57 41 56 48 83 EC 60
@@ -143,9 +151,6 @@ FF FF FF FF 48 C7 41 28 0F 00 00 00 48 89 69 20 40
 88 69 10 89 69 30
 ```
 
-The position signature must resolve exactly once before default traversal can
-continue. The hook changes only the returned in-memory `item_index` and CFI.
-
 ## Options
 
 ```text
@@ -154,17 +159,18 @@ continue. The hook changes only the returned in-memory `item_index` and CFI.
 --timeout-seconds N    Abort capture after N seconds (240).
 --navigation-wait-ms N Extra delay after each page change (0).
 --keep-resources       Keep OUT\_resources after a successful export.
---no-traverse          Disable page navigation for diagnostic resource capture;
-                       the resulting export may be incomplete.
+--no-traverse          Skip page navigation (diagnostic for .dmmb/.dmme;
+                       .dmmr still dumps zip_book).
 --dmmb-output images|epub
-                       For .dmmb, write page images (default) or a fixed-layout EPUB.
+                       For .dmmb: write page images (default) or a fixed-layout EPUB.
 ```
 
 ## Docker self-check
 
 Run this from the repository directory in Git Bash. It creates the Python
-environment inside an ephemeral container, runs the byte-preservation and EPUB
-checks, and compiles the Python sources without writing to the repository.
+environment inside an ephemeral container, runs the byte-preservation, EPUB,
+and OCF-rebuild checks, and compiles the Python sources without writing to the
+repository.
 
 ```sh
 MSYS_NO_PATHCONV=1 docker run --rm \

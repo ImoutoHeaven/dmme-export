@@ -4,9 +4,11 @@ from __future__ import annotations
 import io
 import os
 import sqlite3
+import struct
 import sys
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 from PIL import Image
@@ -269,11 +271,13 @@ def main() -> None:
         assert "position.add(8).writeS64(0)" in ex.JS
         assert "last-position.reset" in ex.JS
         assert "return installURLRead('load_job.ReadRawData', target);" in ex.JS
+        assert "installZipBookDump" in ex.JS
         assert "qt.QQuickText.setText" not in ex.JS
         assert "book-title" not in ex.JS
 
         shelf = Path(temporary) / "dmmbookshelf.sqlite3"
-        with sqlite3.connect(shelf) as connection:
+        connection = sqlite3.connect(shelf)
+        try:
             connection.execute(
                 "CREATE TABLE my_library (product_Id TEXT, title TEXT)"
             )
@@ -285,6 +289,9 @@ def main() -> None:
                 "INSERT INTO my_library VALUES (?, ?)",
                 ("s011akamj03006", "月刊メガストア2026年9月号"),
             )
+            connection.commit()
+        finally:
+            connection.close()
         assert ex.bookshelf_title("k077bscsh09791", shelf) == "記憶の鍵盤（新潮文庫nex）"
         assert ex.bookshelf_title("s011akamj03006", shelf) == "月刊メガストア2026年9月号"
         assert ex.bookshelf_title("missing", shelf) is None
@@ -301,6 +308,23 @@ def main() -> None:
             [str(Path("book.dmmb")), "--dmmb-output", "epub"]
         )
         assert parsed_epub.dmmb_output == "epub"
+
+        payload = b"application/epub+zip"
+        name = b"mimetype"
+        crc = zlib.crc32(payload) & 0xFFFFFFFF
+        local_header = (
+            b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            + struct.pack("<I", crc)
+            + struct.pack("<II", len(payload), len(payload))
+            + struct.pack("<HH", len(name), 0)
+            + name
+            + payload
+        )
+        rebuilt = ex.rebuild_ocf_epub(local_header)
+        with zipfile.ZipFile(io.BytesIO(rebuilt)) as archive:
+            assert archive.namelist() == ["mimetype"]
+            assert archive.read("mimetype") == payload
+            assert archive.testzip() is None
 
         fixed_output = ex.export_fixed_epub(
             [
