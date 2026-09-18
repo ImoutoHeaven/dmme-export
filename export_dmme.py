@@ -824,9 +824,9 @@ function installZipBookDump() {
         if (dumped) return;
         try {
           const unzip = this.self.add(0x60).readPointer();
-          const size = unzip.add(0xa8).readU64().toNumber();
-          if (size < 64 || size > MAX_OCF) {
-            send({type: 'ocf-skip', size: size});
+          const localSize = unzip.add(0xa8).readU64().toNumber();
+          if (localSize < 64 || localSize > MAX_OCF) {
+            send({type: 'ocf-skip', size: localSize});
             return;
           }
           const cursor = Memory.alloc(16);
@@ -837,17 +837,23 @@ function installZipBookDump() {
           const pos = cursor.add(8).readU64();
           zseek(this.self, this.self, ptr(0), 0);
           let got = 0;
-          while (got < size) {
-            const n = Math.min(OCF_CHUNK, size - got);
+          while (got < MAX_OCF) {
+            const n = Math.min(OCF_CHUNK, MAX_OCF - got);
             const buf = Memory.alloc(n);
             const r = zread(this.self, this.self, buf, n);
             if (r <= 0) break;
-            send({type: 'ocf-chunk', off: got, n: r, size: size}, buf.readByteArray(r));
+            send({type: 'ocf-chunk', off: got, n: r,
+                  localSize: localSize}, buf.readByteArray(r));
             got += r;
+          }
+          if (got >= MAX_OCF) {
+            const probe = Memory.alloc(1);
+            const extra = zread(this.self, this.self, probe, 1);
+            if (extra > 0) throw new Error('OCF stream exceeds MAX_OCF');
           }
           zseek(this.self, this.self, ptr(pos.toString()), 0);
           dumped = true;
-          send({type: 'ocf-done', size: got});
+          send({type: 'ocf-done', size: got, localSize: localSize});
         } catch (e) {
           send({type: 'hook-error', name: 'zip_book.dump', error: String(e)});
         }
@@ -965,6 +971,9 @@ class NavigationState:
     jumps: list[int] = field(default_factory=list)
     ocf_zip: bytes | None = None
     ocf_chunks: dict[int, bytes] = field(default_factory=dict)
+    ocf_expected_size: int | None = None
+    ocf_local_size: int | None = None
+    ocf_error: str | None = None
 
 
 class ResourceWriter:
@@ -1433,52 +1442,59 @@ def _zip_directories(names: list[str]) -> list[str]:
     return sorted(directories)
 
 
-def rebuild_ocf_epub(local_headers: bytes) -> bytes:
-    """Turn a local-file-header stream into a ZIP with a central directory."""
-    if not local_headers.startswith(b"PK\x03\x04"):
-        raise RuntimeError("ocf dump is not a ZIP local-file-header stream")
-    offset = 0
-    records: list[tuple[bytes, int]] = []
-    while offset + 30 <= len(local_headers) and local_headers[offset:offset + 4] == b"PK\x03\x04":
-        start = offset
-        compressed = struct.unpack_from("<I", local_headers, offset + 18)[0]
-        name_len, extra_len = struct.unpack_from("<HH", local_headers, offset + 26)
-        header_end = offset + 30 + name_len + extra_len
-        if header_end + compressed > len(local_headers):
-            raise RuntimeError("ocf dump is truncated")
-        records.append((local_headers[start:header_end], start))
-        offset = header_end + compressed
-    if not records:
-        raise RuntimeError("ocf dump has no ZIP entries")
-    if offset != len(local_headers):
-        raise RuntimeError("ocf dump has trailing bytes after local headers")
-    central = bytearray()
-    for header, local_offset in records:
-        _ver, flags, method, time, date = struct.unpack_from("<HHHHH", header, 4)
-        crc, compressed, uncompressed = struct.unpack_from("<III", header, 14)
-        name_len, extra_len = struct.unpack_from("<HH", header, 26)
-        name = header[30:30 + name_len]
-        extra = header[30 + name_len:30 + name_len + extra_len]
-        central.extend(b"PK\x01\x02")
-        central.extend(struct.pack(
-            "<HHHHHHIIIHHHHHII",
-            0x14, 0x14, flags, method, time, date, crc, compressed, uncompressed,
-            name_len, extra_len, 0, 0, 0, 0, local_offset,
-        ))
-        central.extend(name)
-        central.extend(extra)
-    end = bytearray(b"PK\x05\x06")
-    end.extend(struct.pack(
-        "<HHHHIIH",
-        0, 0, len(records), len(records), len(central), offset, 0,
-    ))
-    archive = local_headers + bytes(central) + bytes(end)
-    with zipfile.ZipFile(io.BytesIO(archive)) as parsed:
-        if parsed.testzip() is not None:
-            raise RuntimeError("rebuilt OCF EPUB failed zip integrity")
-        if parsed.namelist()[0] != "mimetype" and "mimetype" not in parsed.namelist():
-            raise RuntimeError("rebuilt OCF EPUB is missing mimetype")
-    return archive
+def extract_ocf_zip(stream: bytes, expected_cd_offset: int | None = None) -> bytes:
+    """Return the exact ZIP prefix from a decrypted OCF stream.
+
+    DMM appends a short container trailer after the ZIP EOCD. The viewer's
+    ``unzip+0xa8`` field is the central-directory offset, not the stream size.
+    """
+    candidates: list[bytes] = []
+    offset = len(stream)
+    while True:
+        offset = stream.rfind(b"PK\x05\x06", 0, offset)
+        if offset < 0:
+            break
+        if offset + 22 > len(stream):
+            continue
+        _signature, disk, cd_disk, disk_entries, entries, cd_size, cd_offset, comment_size = (
+            struct.unpack_from("<IHHHHIIH", stream, offset)
+        )
+        end = offset + 22 + comment_size
+        if (disk or cd_disk or disk_entries != entries or end > len(stream) or
+                cd_offset + cd_size != offset or
+                (expected_cd_offset is not None and cd_offset != expected_cd_offset)):
+            continue
+        candidate = stream[:end]
+        try:
+            with zipfile.ZipFile(io.BytesIO(candidate)) as archive:
+                if (archive.testzip() is not None or archive.namelist()[:1] != ["mimetype"] or
+                        archive.read("mimetype") != b"application/epub+zip"):
+                    continue
+        except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
+            continue
+        candidates.append(candidate)
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "OCF stream has no unique valid ZIP EOCD"
+            if not candidates else "OCF stream has multiple valid ZIP EOCD records"
+        )
+    return candidates[0]
+
+
+def assemble_ocf_chunks(chunks: dict[int, bytes], expected_size: int | None) -> bytes:
+    """Join Frida OCF chunks only when their stream is contiguous and complete."""
+    if not chunks:
+        raise RuntimeError("OCF dump has no chunks")
+    output = bytearray()
+    for offset in sorted(chunks):
+        if offset != len(output):
+            raise RuntimeError(f"OCF chunk gap or overlap at offset {offset}")
+        output.extend(chunks[offset])
+    if expected_size is not None and len(output) != expected_size:
+        raise RuntimeError(
+            f"OCF chunk stream is incomplete: got {len(output)}, expected {expected_size}"
+        )
+    return bytes(output)
 
 
 def export_epub(resources: list[CapturedResource], destination: Path,
@@ -1854,14 +1870,42 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
             return
         kind = payload.get("type")
         if kind == "ocf-chunk":
-            if data:
-                navigation.ocf_chunks[int(payload["off"])] = bytes(data)
-                print(f"[ocf-chunk] off={payload.get('off')} n={payload.get('n')}", flush=True)
+            try:
+                if data is None:
+                    raise RuntimeError("OCF chunk has no payload")
+                offset = int(payload["off"])
+                size = int(payload["n"])
+                if len(data) != size:
+                    raise RuntimeError(
+                        f"OCF chunk length mismatch at {offset}: got {len(data)}, expected {size}"
+                    )
+                if offset in navigation.ocf_chunks:
+                    raise RuntimeError(f"duplicate OCF chunk at offset {offset}")
+                navigation.ocf_chunks[offset] = bytes(data)
+                if "localSize" in payload:
+                    local_size = int(payload["localSize"])
+                    if (navigation.ocf_local_size is not None and
+                            navigation.ocf_local_size != local_size):
+                        raise RuntimeError("OCF chunk localSize changed")
+                    navigation.ocf_local_size = local_size
+                print(f"[ocf-chunk] off={offset} n={size}", flush=True)
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                navigation.ocf_error = str(exc)
         elif kind == "ocf-done":
-            navigation.ocf_zip = b"".join(
-                navigation.ocf_chunks[off] for off in sorted(navigation.ocf_chunks)
-            )
-            print(f"[ocf-zip] {len(navigation.ocf_zip)} bytes", flush=True)
+            try:
+                navigation.ocf_expected_size = int(payload["size"])
+                if "localSize" in payload:
+                    local_size = int(payload["localSize"])
+                    if (navigation.ocf_local_size is not None and
+                            navigation.ocf_local_size != local_size):
+                        raise RuntimeError("OCF done localSize changed")
+                    navigation.ocf_local_size = local_size
+                navigation.ocf_zip = assemble_ocf_chunks(
+                    navigation.ocf_chunks, navigation.ocf_expected_size
+                )
+                print(f"[ocf-zip] {len(navigation.ocf_zip)} bytes", flush=True)
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                navigation.ocf_error = str(exc)
         elif kind == "resource-chunk":
             if data is not None:
                 writer.submit(payload, data)
@@ -1904,6 +1948,8 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
             "url-metadata-ready", "url-request", "url-job",
             "ocf-zip", "ocf-done", "ocf-skip",
         }:
+            if kind == "hook-error" and payload.get("name") == "zip_book.dump":
+                navigation.ocf_error = str(payload.get("error") or "zip_book dump hook failed")
             if kind in {"hook-installed", "hook-missing", "hook-error"}:
                 name = payload.get("name")
                 if name == "load_job.ReadRawData":
@@ -1978,6 +2024,8 @@ def wait_for_resources(writer: ResourceWriter, settle_seconds: float,
             raise RuntimeError("load_job.ReadRawData hook was not installed")
         if navigation.last_position_hooked is False:
             raise RuntimeError("last-position reset hook was not installed")
+        if navigation.ocf_error:
+            raise RuntimeError(navigation.ocf_error)
         if stop_on_ocf and navigation.ocf_zip:
             return
 
@@ -2091,7 +2139,9 @@ def main(argv: list[str] | None = None) -> int:
             if not navigation.ocf_zip:
                 raise RuntimeError("zip_book dump was empty; keep resources for diagnosis")
             output = out_dir / f"{book.stem}.epub"
-            output.write_bytes(rebuild_ocf_epub(navigation.ocf_zip))
+            output.write_bytes(extract_ocf_zip(
+                navigation.ocf_zip, navigation.ocf_local_size
+            ))
             print(f"[title] {publication_title(book)}", flush=True)
         elif epub_mode:
             if traverse:

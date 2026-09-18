@@ -4,11 +4,9 @@ from __future__ import annotations
 import io
 import os
 import sqlite3
-import struct
 import sys
 import tempfile
 import zipfile
-import zlib
 from pathlib import Path
 
 from PIL import Image
@@ -320,22 +318,31 @@ def main() -> None:
         )
         assert parsed_epub.dmmb_output == "epub"
 
-        payload = b"application/epub+zip"
-        name = b"mimetype"
-        crc = zlib.crc32(payload) & 0xFFFFFFFF
-        local_header = (
-            b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-            + struct.pack("<I", crc)
-            + struct.pack("<II", len(payload), len(payload))
-            + struct.pack("<HH", len(name), 0)
-            + name
-            + payload
-        )
-        rebuilt = ex.rebuild_ocf_epub(local_header)
-        with zipfile.ZipFile(io.BytesIO(rebuilt)) as archive:
-            assert archive.namelist() == ["mimetype"]
-            assert archive.read("mimetype") == payload
-            assert archive.testzip() is None
+        exact_source = Path(temporary) / "exact-source.epub"
+        with zipfile.ZipFile(exact_source, "w") as archive:
+            archive.writestr("mimetype", b"application/epub+zip", zipfile.ZIP_STORED)
+            archive.writestr("item.xhtml", b"<html/>", zipfile.ZIP_DEFLATED)
+        exact_bytes = exact_source.read_bytes()
+        assert ex.extract_ocf_zip(exact_bytes + b"\0\0trailer") == exact_bytes
+        assert ex.assemble_ocf_chunks(
+            {0: exact_bytes[:3], 3: exact_bytes[3:]}, len(exact_bytes)
+        ) == exact_bytes
+        for chunks, expected_error in (
+            ({1: exact_bytes}, "gap"),
+            ({0: exact_bytes, 1: b"duplicate"}, "gap or overlap"),
+        ):
+            try:
+                ex.assemble_ocf_chunks(chunks, len(exact_bytes))
+            except RuntimeError as exc:
+                assert expected_error in str(exc)
+            else:
+                raise AssertionError("invalid OCF chunk layout should fail")
+        try:
+            ex.extract_ocf_zip(b"PK\\x03\\x04incomplete")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("an incomplete local-header stream must fail exact extraction")
 
         fixed_output = ex.export_fixed_epub(
             [

@@ -13,9 +13,9 @@ book type.
   `<book-name>.epub`.
 - `.dmme` and `.dmmr` produce `<book-name>.epub` from the viewer's in-memory
   OCF ZIP (`zip_book`): original `mimetype`, `META-INF/container.xml`,
-  `item/standard.opf`, and publication resources. The dump is a stream of ZIP
-  local file headers; the exporter appends a central directory so the file is a
-  standard EPUB ZIP.
+  `item/standard.opf`, publication resources, and the original ZIP central
+  directory. The exporter copies the decrypted ZIP through its EOCD byte-for-byte
+  and removes only the viewer/container trailer after the EOCD.
 
 For `.dmmb --dmmb-output epub`, EPUB `dc:title` is `my_library.title` for
 `product_Id` (the filename stem) in
@@ -90,13 +90,18 @@ image bytes on different logical pages are retained.
 
 For `.dmme` and `.dmmr`, capture finishes when the `zip_book` dump arrives. The
 pinned build dumps the decrypted OCF at RVA `0x1349E0` with `zseek(0)` and
-chunked `zread` of the unzip size at `this+0x60+0xa8`. The rebuilt EPUB uses
-the publication OPF spine (`item/standard.opf`).
+chunked `zread` until EOF, subject to the `256 MiB` capture limit. The field
+at `this+0x60+0xa8` is the ZIP central-directory offset, not the complete
+stream length. The exporter locates
+the valid EOCD, writes the exact ZIP prefix through that record, and excludes
+the short viewer/container trailer. The publication keeps its original spine
+and manifest from `item/standard.opf`.
 
 ## EPUB compatibility
 
-A `.dmme` or `.dmmr` EPUB is the dumped OCF plus a ZIP central directory. It
-keeps the package `full-path` from `META-INF/container.xml` (typically
+A `.dmme` or `.dmmr` EPUB is the exact decrypted OCF ZIP prefix through its
+original EOCD. It preserves the original central-directory metadata and keeps
+the package `full-path` from `META-INF/container.xml` (typically
 `item/standard.opf`).
 
 A `.dmmb --dmmb-output epub` file is a generated container:
@@ -169,7 +174,7 @@ FF FF FF FF 48 C7 41 28 0F 00 00 00 48 89 69 20 40
 
 Run this from the repository directory in Git Bash. It creates the Python
 environment inside an ephemeral container, runs the byte-preservation, EPUB,
-and OCF-rebuild checks, and compiles the Python sources without writing to the
+and exact OCF ZIP checks, and compiles the Python sources without writing to the
 repository.
 
 ```sh
