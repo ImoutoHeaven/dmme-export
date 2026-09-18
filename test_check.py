@@ -277,6 +277,12 @@ def main() -> None:
         assert "dmmb.page.flush" in ex.JS
         assert "spreadComplete" in ex.JS
         assert "Date.now() - navigationLastResourceAt >= 200" in ex.JS
+        js = ex.JS.replace("\r", "")
+        start = js.find("function navigationTick()")
+        tick = js[start:js.find("\nlet navigationEnabled", start)]
+        catch = tick[tick.rfind("catch (e)"):]
+        assert "navigation-error" in catch
+        assert "navigationDone" not in catch
         assert "qt.QQuickText.setText" not in ex.JS
         assert "book-title" not in ex.JS
 

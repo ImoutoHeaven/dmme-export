@@ -598,14 +598,22 @@ function navigationLocateCanvas() {
   return null;
 }
 function navigationPropertyIndex(name) {
-  return navIndexOfProperty(navMetaObject(navigationCanvas), Memory.allocUtf8String(name));
+  try {
+    return navIndexOfProperty(navMetaObject(navigationCanvas), Memory.allocUtf8String(name));
+  } catch (_) {
+    return -1;
+  }
 }
 function navigationReadProperty(index) {
   if (index < 0) return -1;
-  navigationValue.writeS32(0);
-  navigationArgv.writePointer(navigationValue);
-  navMetacall(navigationCanvas, 1, index, navigationArgv);
-  return navigationValue.readS32();
+  try {
+    navigationValue.writeS32(0);
+    navigationArgv.writePointer(navigationValue);
+    navMetacall(navigationCanvas, 1, index, navigationArgv);
+    return navigationValue.readS32();
+  } catch (_) {
+    return -1;
+  }
 }
 function navigationInvoke(page) {
   navigationPage = page;
@@ -667,8 +675,7 @@ function navigationTick() {
       navigationPageCountIndex = navigationPropertyIndex('pageCount');
       navigationCurrentPageIndex = navigationPropertyIndex('currentPage');
       if (navigationPageCountIndex < 0 || navigationCurrentPageIndex < 0) {
-        send({type: 'navigation-error', error: 'PageCanvas properties not found'});
-        navigationDone = true;
+        navigationCanvas = null;
         return;
       }
       send({type: 'navigation-canvas', address: navigationCanvas.toString()});
@@ -676,6 +683,7 @@ function navigationTick() {
     const count = navigationReadProperty(navigationPageCountIndex);
     if (count <= 0) return;
     const current = navigationReadProperty(navigationCurrentPageIndex);
+    if (current < 0) return;
     if (dmmbPages) {
       if (!navigationOrderPages) {
         navigationOrderPages = [];
@@ -737,7 +745,6 @@ function navigationTick() {
     }
   } catch (e) {
     send({type: 'navigation-error', error: String(e)});
-    navigationDone = true;
   }
 }
 
