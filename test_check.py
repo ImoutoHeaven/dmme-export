@@ -321,9 +321,13 @@ def main() -> None:
         exact_source = Path(temporary) / "exact-source.epub"
         with zipfile.ZipFile(exact_source, "w") as archive:
             archive.writestr("mimetype", b"application/epub+zip", zipfile.ZIP_STORED)
+            archive.writestr("META-INF/container.xml", b"<container/>", zipfile.ZIP_DEFLATED)
             archive.writestr("item.xhtml", b"<html/>", zipfile.ZIP_DEFLATED)
+            archive.comment = b"original comment"
         exact_bytes = exact_source.read_bytes()
         assert ex.extract_ocf_zip(exact_bytes + b"\0\0trailer") == exact_bytes
+        with zipfile.ZipFile(io.BytesIO(ex.extract_ocf_zip(exact_bytes))) as archive:
+            assert archive.comment == b"original comment"
         assert ex.assemble_ocf_chunks(
             {0: exact_bytes[:3], 3: exact_bytes[3:]}, len(exact_bytes)
         ) == exact_bytes

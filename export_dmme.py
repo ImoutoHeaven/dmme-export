@@ -1468,7 +1468,8 @@ def extract_ocf_zip(stream: bytes, expected_cd_offset: int | None = None) -> byt
         try:
             with zipfile.ZipFile(io.BytesIO(candidate)) as archive:
                 if (archive.testzip() is not None or archive.namelist()[:1] != ["mimetype"] or
-                        archive.read("mimetype") != b"application/epub+zip"):
+                        archive.read("mimetype") != b"application/epub+zip" or
+                        "META-INF/container.xml" not in archive.namelist()):
                     continue
         except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
             continue
@@ -1906,6 +1907,8 @@ def _script_for(session: Any, mode: str, writer: ResourceWriter,
                 print(f"[ocf-zip] {len(navigation.ocf_zip)} bytes", flush=True)
             except (KeyError, TypeError, ValueError, RuntimeError) as exc:
                 navigation.ocf_error = str(exc)
+        elif kind == "ocf-skip":
+            navigation.ocf_error = f"OCF stream size is invalid: {payload.get('size')}"
         elif kind == "resource-chunk":
             if data is not None:
                 writer.submit(payload, data)
