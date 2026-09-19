@@ -275,6 +275,7 @@ def main() -> None:
         assert "dmmb.page.flush" in ex.JS
         assert "spreadBuffer.push" in ex.JS
         assert "assignedPage += 1" not in ex.JS
+        assert "capturedHash[item.hash]" not in ex.JS
         assert "spreadBuffer.length > 0" in ex.JS
         assert "current === pending" in ex.JS
         js = ex.JS.replace("\r", "")

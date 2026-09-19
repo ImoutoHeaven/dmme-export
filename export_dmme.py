@@ -637,13 +637,6 @@ function navigationMakeOrder(count) {
   for (let i = 0; i < count; i++) result.push(i);
   return result;
 }
-function imageHash(raw, size) {
-  const u = new Uint8Array(raw);
-  let h = size >>> 0;
-  const n = Math.min(64, u.length);
-  for (let i = 0; i < n; i++) h = Math.imul(h, 16777619) ^ u[i];
-  return size + ':' + (h >>> 0);
-}
 function nextUnseenPage(count) {
   for (let i = 0; i < count; i++) if (!capturedPages[i]) return i;
   return count;
@@ -656,15 +649,12 @@ function emitSpread(current, count) {
   const items = spreadBuffer.splice(0, spreadBuffer.length);
   for (const key in spreadSeen) delete spreadSeen[key];
   if (current < 0 || current >= count) return 0;
-  let page = current;
   let n = 0;
   for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    if (capturedHash[item.hash]) continue;
-    while (page < count && capturedPages[page]) page++;
-    if (page >= count) break;
+    const page = current + i;
+    if (page >= count || capturedPages[page]) continue;
     capturedPages[page] = 1;
-    capturedHash[item.hash] = 1;
+    const item = items[i];
     const sequence = callSequence++;
     send({type: 'navigation-jump', page: page, current: current, queued: 1});
     send({
@@ -684,7 +674,6 @@ function emitSpread(current, count) {
       page: page
     });
     n++;
-    page++;
   }
   return n;
 }
@@ -802,7 +791,6 @@ let navigationLastResourceAt = 0;
 const spreadBuffer = [];
 const spreadSeen = {};
 const capturedPages = {};
-const capturedHash = {};
 let navTopLevelWidgets = null;
 let navRootObject = null;
 let navChildren = null;
@@ -927,10 +915,7 @@ function installPageFlush() {
           const owner = this.self.toString();
           if (spreadSeen[owner]) return;
           spreadSeen[owner] = 1;
-          spreadBuffer.push({
-            owner: owner, size: size, bytes: raw,
-            hash: imageHash(raw, size)
-          });
+          spreadBuffer.push({owner: owner, size: size, bytes: raw});
         } catch (e) {
           send({type: 'hook-error', name: 'dmmb.page.flush', error: String(e)});
         }
