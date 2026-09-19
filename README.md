@@ -82,11 +82,13 @@ collects the opening spread from flush, then `pageJump`s from `1` through
 
 For `.dmmb`, the viewer decrypts the current spread into page objects. Capture
 hooks `FUN_140021b80` (fill) and `FUN_140020ed0` (flush) at RVAs `0x21B80` and
-`0x20ED0`. A flush copies the plaintext JPEG or PNG at `this+0xa0`. The next
-`pageJump` runs only after that spread's flushes match its fills. Page numbers
-are assigned at flush, in capture order. Navigation coverage and the number of
-page-sized image resources must match the viewer's logical page count. Identical
-image bytes on different logical pages are retained.
+`0x20ED0`. A flush buffers the plaintext JPEG or PNG at `this+0xa0` without a
+page number. Capture assigns pages when `PageCanvas.currentPage` equals the
+pending `pageJump`, using that settled index for the spread (`current`,
+`current+1` on a two-page spread). The next `pageJump` runs after that emit.
+Navigation coverage and the number of page-sized image resources must match the
+viewer's logical page count. Identical image bytes on different logical pages
+are retained.
 
 For `.dmme` and `.dmmr`, capture finishes when the `zip_book` dump arrives. The
 pinned build dumps the decrypted OCF at RVA `0x1349E0` with `zseek(0)` and

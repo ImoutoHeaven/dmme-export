@@ -637,22 +637,56 @@ function navigationMakeOrder(count) {
   for (let i = 0; i < count; i++) result.push(i);
   return result;
 }
-function spreadComplete() {
-  return spreadArmed && spreadFill > 0 && spreadFlush >= spreadFill;
+function imageHash(raw, size) {
+  const u = new Uint8Array(raw);
+  let h = size >>> 0;
+  const n = Math.min(64, u.length);
+  for (let i = 0; i < n; i++) h = Math.imul(h, 16777619) ^ u[i];
+  return size + ':' + (h >>> 0);
+}
+function nextUnseenPage(count) {
+  for (let i = 0; i < count; i++) if (!capturedPages[i]) return i;
+  return count;
 }
 function resetSpread() {
-  spreadFill = 0;
-  spreadFlush = 0;
-  spreadArmed = false;
-  for (const key in spreadEmitted) delete spreadEmitted[key];
+  spreadBuffer.splice(0, spreadBuffer.length);
+  for (const key in spreadSeen) delete spreadSeen[key];
 }
-function finishIfCaptured(count) {
-  if (assignedPage >= count) {
-    navigationDone = true;
-    send({type: 'navigation-done', pageCount: count, assigned: assignedPage});
-    return true;
+function emitSpread(current, count) {
+  const items = spreadBuffer.splice(0, spreadBuffer.length);
+  for (const key in spreadSeen) delete spreadSeen[key];
+  if (current < 0 || current >= count) return 0;
+  let page = current;
+  let n = 0;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (capturedHash[item.hash]) continue;
+    while (page < count && capturedPages[page]) page++;
+    if (page >= count) break;
+    capturedPages[page] = 1;
+    capturedHash[item.hash] = 1;
+    const sequence = callSequence++;
+    send({type: 'navigation-jump', page: page, current: current, queued: 1});
+    send({
+      type: 'resource-chunk',
+      source: 'dmmb.page.flush',
+      owner: item.owner + ':' + page,
+      sequence: sequence,
+      page: page,
+      requested: item.size,
+      size: item.size
+    }, item.bytes);
+    send({
+      type: 'resource-eof',
+      source: 'dmmb.page.flush',
+      owner: item.owner + ':' + page,
+      sequence: sequence,
+      page: page
+    });
+    n++;
+    page++;
   }
-  return false;
+  return n;
 }
 function turnTo(page, current, count) {
   resetSpread();
@@ -660,7 +694,7 @@ function turnTo(page, current, count) {
   navigationPendingPage = page;
   navigationSentAt = Date.now();
   send({type: 'navigation-turn', page: page, current: current, queued: queued,
-        assigned: assignedPage, count: count});
+        assigned: nextUnseenPage(count), count: count});
 }
 function navigationTick() {
   try {
@@ -690,16 +724,19 @@ function navigationTick() {
         send({type: 'navigation-properties', pageCount: count,
               currentPage: current, order: navigationOrder, count: count});
       }
-      if (navigationPendingPage === null) {
-        if (!spreadComplete()) return;
-        if (finishIfCaptured(count)) return;
-        turnTo(assignedPage, current, count);
-        return;
-      }
-      if (current === navigationPendingPage && spreadComplete()) {
-        if (finishIfCaptured(count)) return;
-        turnTo(assignedPage, current, count);
-      } else if (current !== navigationPendingPage && Date.now() - navigationSentAt > 8000) {
+      const pending = navigationPendingPage === null ? current : navigationPendingPage;
+      const settled = current === pending;
+      const ready = settled && spreadBuffer.length > 0;
+      if (ready) {
+        const n = emitSpread(current, count);
+        const next = nextUnseenPage(count);
+        if (next >= count) {
+          navigationDone = true;
+          send({type: 'navigation-done', pageCount: count, assigned: next});
+          return;
+        }
+        turnTo(next, current, count);
+      } else if (!settled && Date.now() - navigationSentAt > 8000) {
         const queued = navigationInvoke(navigationPendingPage);
         navigationSentAt = Date.now();
         send({type: 'navigation-retry', page: navigationPendingPage,
@@ -762,11 +799,10 @@ let navigationPendingPage = null;
 let navigationSentAt = 0;
 let navigationReadyAt = 0;
 let navigationLastResourceAt = 0;
-let spreadFill = 0;
-let spreadFlush = 0;
-let spreadArmed = false;
-let assignedPage = 0;
-const spreadEmitted = {};
+const spreadBuffer = [];
+const spreadSeen = {};
+const capturedPages = {};
+const capturedHash = {};
 let navTopLevelWidgets = null;
 let navRootObject = null;
 let navChildren = null;
@@ -876,45 +912,24 @@ function installPageFlush() {
     return false;
   }
   try {
-    Interceptor.attach(main.base.add(fillRva), {
-      onEnter() { spreadArmed = true; }
-    });
     Interceptor.attach(main.base.add(flushRva), {
       onEnter(args) { this.self = args[0]; },
       onLeave() {
         try {
           const size = this.self.add(0x98).readU32();
-          const bytes = this.self.add(0xa0).readPointer();
-          if (bytes.isNull() || size < 128 || size > MAX_CHUNK) return;
-          const head = new Uint8Array(bytes.readByteArray(Math.min(16, size)));
+          const ptr = this.self.add(0xa0).readPointer();
+          if (ptr.isNull() || size < 128 || size > MAX_CHUNK) return;
+          const raw = ptr.readByteArray(size);
+          const head = new Uint8Array(raw.slice(0, Math.min(16, size)));
           const jpeg = head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff;
           const png = head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47;
           if (!jpeg && !png) return;
           const owner = this.self.toString();
-          if (spreadEmitted[owner]) return;
-          spreadEmitted[owner] = 1;
-          spreadArmed = true;
-          spreadFill += 1;
-          spreadFlush += 1;
-          const page = assignedPage;
-          assignedPage += 1;
-          const sequence = callSequence++;
-          send({type: 'navigation-jump', page: page, current: page, queued: 1});
-          send({
-            type: 'resource-chunk',
-            source: 'dmmb.page.flush',
-            owner: this.self.toString() + ':' + page,
-            sequence: sequence,
-            page: page,
-            requested: size,
-            size: size
-          }, bytes.readByteArray(size));
-          send({
-            type: 'resource-eof',
-            source: 'dmmb.page.flush',
-            owner: this.self.toString() + ':' + page,
-            sequence: sequence,
-            page: page
+          if (spreadSeen[owner]) return;
+          spreadSeen[owner] = 1;
+          spreadBuffer.push({
+            owner: owner, size: size, bytes: raw,
+            hash: imageHash(raw, size)
           });
         } catch (e) {
           send({type: 'hook-error', name: 'dmmb.page.flush', error: String(e)});

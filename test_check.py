@@ -273,8 +273,10 @@ def main() -> None:
         assert "ocf-chunk" in ex.JS
         assert "MAX_OCF" in ex.JS
         assert "dmmb.page.flush" in ex.JS
-        assert "spreadComplete" in ex.JS
-        assert "Date.now() - navigationLastResourceAt >= 200" in ex.JS
+        assert "spreadBuffer.push" in ex.JS
+        assert "assignedPage += 1" not in ex.JS
+        assert "spreadBuffer.length > 0" in ex.JS
+        assert "current === pending" in ex.JS
         js = ex.JS.replace("\r", "")
         start = js.find("function navigationTick()")
         tick = js[start:js.find("\nlet navigationEnabled", start)]
